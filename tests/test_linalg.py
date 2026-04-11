@@ -102,27 +102,29 @@ class TestCholesky:
 
 
 class TestTriangularSolve:
-    def test_tril(self):
-        A_np = _make_spd(30, 6)
+    @pytest.mark.parametrize("k", [6, 20, 48, 64, 80, 96])
+    def test_tril(self, k):
+        A_np = _make_spd(30, k)
         A = mx.array(A_np.astype(np.float32))
         L = cholesky(A)
-        b = mx.array(_make_rhs(30, 6).astype(np.float32))
+        b = mx.array(_make_rhs(30, k).astype(np.float32))
         x = tril_solve(L, b)
         mx.eval(x)
         residual = L @ x - b
         mx.eval(residual)
-        assert np.max(np.abs(np.array(residual))) < 1e-3
+        assert np.max(np.abs(np.array(residual))) < 5e-3, f"k={k}"
 
-    def test_triu(self):
-        A_np = _make_spd(30, 6)
+    @pytest.mark.parametrize("k", [6, 20, 48, 64, 80, 96])
+    def test_triu(self, k):
+        A_np = _make_spd(30, k)
         A = mx.array(A_np.astype(np.float32))
         L = cholesky(A)
-        b = mx.array(_make_rhs(30, 6).astype(np.float32))
+        b = mx.array(_make_rhs(30, k).astype(np.float32))
         x = triu_solve(L, b)
         mx.eval(x)
         residual = L.swapaxes(-2, -1) @ x - b
         mx.eval(residual)
-        assert np.max(np.abs(np.array(residual))) < 1e-3
+        assert np.max(np.abs(np.array(residual))) < 5e-3, f"k={k}"
 
 
 # ============================================================
@@ -171,11 +173,12 @@ class TestDet:
 
 
 class TestQR:
-    @pytest.mark.parametrize("k", [3, 5, 8, 10, 16, 20, 32])
+    @pytest.mark.parametrize("k", [3, 5, 8, 10, 16, 20, 32, 48, 63, 64, 96, 128])
     def test_accuracy_vs_cpu(self, k):
         """GPU QR reconstruction: ||A - QR|| < tol."""
         rng = np.random.default_rng(42)
-        A_np = rng.standard_normal((50, k, k)).astype(np.float32)
+        batch = 50 if k <= 64 else 10
+        A_np = rng.standard_normal((batch, k, k)).astype(np.float32)
         A = mx.array(A_np)
 
         Q_gpu, R_gpu = qr(A)
@@ -184,7 +187,8 @@ class TestQR:
         recon = Q_gpu @ R_gpu
         mx.eval(recon)
         err = np.max(np.abs(np.array(recon) - A_np))
-        assert err < 1e-3, f"k={k}: reconstruction error {err:.2e}"
+        tol = 1e-3 if k <= 63 else 5e-3
+        assert err < tol, f"k={k}: reconstruction error {err:.2e}"
 
     @pytest.mark.parametrize("k", [3, 8, 16])
     def test_orthogonality(self, k):

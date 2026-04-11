@@ -2,9 +2,9 @@
 GPU-accelerated batched linear algebra for MLX.
 
 Metal GPU kernels for Cholesky, solve, QR, and determinant on batched matrices
-of **any size**. Small matrices (k <= 32) use per-thread Metal kernels.
-Larger matrices use a blocked algorithm: small Metal kernels for diagonal
-blocks + MLX matmul for the bulk of the work (SYRK updates).
+of **any size**. Small matrices (k <= 128) use direct Metal kernels with three tiers:
+per-thread (k<=32), threadgroup-cooperative (33-80), large per-thread (81-128).
+Larger matrices use a blocked algorithm with GPU matmul for SYRK updates.
 
 Usage::
 
@@ -22,9 +22,9 @@ Usage::
 Functions:
     solve       - Batched A @ x = b for SPD matrices (Cholesky-based, any size)
     cholesky    - Batched Cholesky factorization (any size)
-    qr          - Batched Householder QR factorization (k <= 32)
-    tril_solve  - Batched forward substitution L @ x = b (k <= 32)
-    triu_solve  - Batched back substitution L^T @ x = b (k <= 32)
+    qr          - Batched Householder QR factorization (k <= 128)
+    tril_solve  - Batched forward substitution L @ x = b (k <= 128)
+    triu_solve  - Batched back substitution L^T @ x = b (k <= 128)
     det         - Batched determinant via LU factorization
     slogdet     - Batched signed log-determinant via LU
     logdet_spd  - Batched log-determinant for SPD matrices via GPU Cholesky
@@ -36,6 +36,7 @@ from ._metal_kernels import (
     triu_solve,
     qr,
     MAX_GPU_K,
+    SHARED_K_MAX,
 )
 from ._det import det, slogdet, logdet_spd
 
@@ -53,4 +54,5 @@ __all__ = [
     "slogdet",
     "logdet_spd",
     "MAX_GPU_K",
+    "SHARED_K_MAX",
 ]

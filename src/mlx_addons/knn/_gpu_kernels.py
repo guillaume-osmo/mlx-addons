@@ -76,8 +76,8 @@ _KNN_FUSED_SRC = """
     if (qi >= NQUERY) return;
 
     // Load current top-k heap (distances + indices)
-    float heap_d[64];
-    int   heap_i[64];
+    float heap_d[K];
+    int   heap_i[K];
     for (uint h = 0; h < K; h++) {
         heap_d[h] = rnn[qi * K + h];
         heap_i[h] = inn[qi * K + h];
@@ -232,7 +232,7 @@ def knn_fused_gpu(pos: mx.array, target_ids: mx.array, seg_offsets: mx.array,
     Returns:
         (rnn, inn) — (nquery, k) distances and indices.
     """
-    assert k <= 64
+    assert k <= 256
     dim = pos.shape[1]
     kernel = _get("knn_fused_out")
     rnn, inn = kernel(

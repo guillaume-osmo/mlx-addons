@@ -31,8 +31,8 @@ _TOPK_MERGE_SRC = """
     uint row = thread_position_in_grid.x;
     if (row >= L) return;
 
-    float r[64];
-    int   idx[64];
+    float r[K];
+    int   idx[K];
     for (uint i = 0; i < K; i++) {
         r[i]   = cur_dist[row * K + i];
         idx[i] = cur_ids[row * K + i];
@@ -233,7 +233,7 @@ def batched_l2_gpu(pos: mx.array, query_ids: mx.array, target_ids: mx.array) -> 
 def topk_merge_gpu(new_dist, new_ids, cur_dist, cur_ids, k):
     """Merge new candidates into existing top-k on GPU."""
     L, M = new_dist.shape
-    assert k <= 64
+    assert k <= 256
     kernel = _get_kernel("topk_merge")
     out_dist, out_ids = kernel(
         inputs=[mx.reshape(new_dist, (-1,)), new_ids,
@@ -278,7 +278,7 @@ def segmented_topk_gpu(flat_dist: mx.array, target_ids: mx.array, seg_offsets: m
                        cur_dist: mx.array, cur_ids: mx.array, k: int):
     """Segmented per-query top-k on GPU."""
     Q = cur_dist.shape[0]
-    assert k <= 64
+    assert k <= 256
     kernel = _get_kernel("segmented_topk")
     out_dist, out_ids = kernel(
         inputs=[flat_dist, target_ids, seg_offsets,

@@ -22,20 +22,21 @@ from ._metal_kernels import (
     cholesky as _small_cholesky,
     tril_solve as _small_tril_solve,
     MAX_GPU_K,
+    SHARED_K_MAX,
 )
 
 # Block size for tiled decomposition. Must be <= MAX_GPU_K.
-# 32 is optimal: large enough for good matmul efficiency,
-# small enough for our per-thread Metal kernel.
-BLOCK_SIZE = MAX_GPU_K
+# Use SHARED_K_MAX (80) so diagonal blocks hit the fast threadgroup-
+# cooperative Metal kernel with shared memory.
+BLOCK_SIZE = SHARED_K_MAX
 
 
 def blocked_cholesky(A: mx.array) -> mx.array:
     """
     Batched Cholesky factorization for SPD matrices of ANY size on GPU.
 
-    For k <= 32: dispatches directly to Metal kernel (one thread per matrix).
-    For k > 32: uses blocked algorithm with matmul-heavy SYRK updates.
+    For k <= 80: dispatches directly to Metal kernel (threadgroup or per-thread).
+    For k > 80: uses blocked algorithm with matmul-heavy SYRK updates.
 
     Args:
         A: (batch, n, n) symmetric positive definite matrices
@@ -45,7 +46,7 @@ def blocked_cholesky(A: mx.array) -> mx.array:
     """
     batch, n, _ = A.shape
 
-    if n <= MAX_GPU_K:
+    if n <= SHARED_K_MAX:
         return _small_cholesky(A)
 
     B = BLOCK_SIZE
@@ -152,7 +153,7 @@ def blocked_solve(A: mx.array, b: mx.array) -> mx.array:
     """
     batch, n, _ = A.shape
 
-    if n <= MAX_GPU_K:
+    if n <= SHARED_K_MAX:
         return _small_solve(A, b)
 
     was_2d = b.ndim == 2
