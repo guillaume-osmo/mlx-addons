@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mlx-addons"
+version = "0.1.0"
+description = "GPU-accelerated operations for MLX on Apple Silicon"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Guillaume", email = "guillaume@osmo.ai"},
+]
+keywords = ["mlx", "apple-silicon", "gpu", "metal", "linear-algebra", "knn"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "mlx>=0.20.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "scipy>=1.10.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/guillaume-osmo/mlx-addons"
+Repository = "https://github.com/guillaume-osmo/mlx-addons"
+Issues = "https://github.com/guillaume-osmo/mlx-addons/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
