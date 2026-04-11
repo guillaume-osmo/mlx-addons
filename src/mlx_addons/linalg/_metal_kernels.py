@@ -692,3 +692,282 @@ def qr(A: mx.array) -> tuple:
         R = mx.squeeze(R, axis=0)
 
     return Q, R
+
+
+# ---------------------------------------------------------------------------
+# LU-based solve with partial pivoting (handles ANY matrix, not just SPD)
+# ---------------------------------------------------------------------------
+
+# Single-thread LU kernel (k <= 32). Uses device memory for LU matrix,
+# thread-local float y[32] for the solve phase.
+_LU_SOLVE_SRC = """
+uint bid = thread_position_in_grid.x;
+if (bid >= BATCH) return;
+
+uint base = bid * K * K;
+
+// Copy A -> LU in device memory
+for (uint i = 0; i < K; i++)
+    for (uint j = 0; j < K; j++)
+        LU[base + i * K + j] = A[base + i * K + j];
+
+uint pbase = bid * K;
+
+// LU factorization with partial pivoting
+for (uint j = 0; j < K; j++) {
+    float max_val = 0.0f;
+    uint max_row = j;
+    for (uint i = j; i < K; i++) {
+        float v = LU[base + i * K + j];
+        float av = v < 0 ? -v : v;
+        if (av > max_val) { max_val = av; max_row = i; }
+    }
+    piv[pbase + j] = max_row;
+    if (max_row != j) {
+        for (uint c = 0; c < K; c++) {
+            float tmp = LU[base + j * K + c];
+            LU[base + j * K + c] = LU[base + max_row * K + c];
+            LU[base + max_row * K + c] = tmp;
+        }
+    }
+    float diag = LU[base + j * K + j];
+    if (diag != 0.0f) {
+        float inv_diag = 1.0f / diag;
+        for (uint i = j + 1; i < K; i++) {
+            LU[base + i * K + j] *= inv_diag;
+            for (uint c = j + 1; c < K; c++)
+                LU[base + i * K + c] -= LU[base + i * K + j] * LU[base + j * K + c];
+        }
+    }
+}
+
+// Solve Ax = b via PLUx = b
+uint bbase = bid * K * M;
+for (uint col = 0; col < M; col++) {
+    float y[32];
+    for (uint i = 0; i < K; i++) y[i] = b[bbase + i * M + col];
+    // Pivot
+    for (uint i = 0; i < K; i++) {
+        uint pi = piv[pbase + i];
+        if (pi != i) { float tmp = y[i]; y[i] = y[pi]; y[pi] = tmp; }
+    }
+    // Forward sub (unit lower)
+    for (uint i = 1; i < K; i++)
+        for (uint p = 0; p < i; p++)
+            y[i] -= LU[base + i * K + p] * y[p];
+    // Back sub (upper)
+    for (int i = (int)K - 1; i >= 0; i--) {
+        for (uint p = (uint)i + 1; p < K; p++)
+            y[(uint)i] -= LU[base + (uint)i * K + p] * y[p];
+        y[(uint)i] /= LU[base + (uint)i * K + (uint)i];
+    }
+    for (uint i = 0; i < K; i++) x[bbase + i * M + col] = y[i];
+}
+"""
+
+# Threadgroup-cooperative LU kernel (32 < k <= SHARED_K_MAX).
+# Uses shared memory for the LU matrix, parallel column updates.
+_LU_SOLVE_TG_SRC = """
+uint tg_id = thread_position_in_grid.x / K;
+uint tid    = thread_position_in_grid.x % K;
+if (tg_id >= BATCH) return;
+
+uint base = tg_id * K * K;
+
+threadgroup float sLU[K * K];
+threadgroup uint  spiv[K];
+
+// Load A into shared memory
+for (uint j = tid; j < K; j += K)
+    for (uint i = 0; i < K; i++)
+        sLU[i * K + j] = A[base + i * K + j];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// LU factorization (thread 0 does pivoting, all threads do column updates)
+for (uint j = 0; j < K; j++) {
+    if (tid == 0) {
+        float max_val = 0.0f;
+        uint max_row = j;
+        for (uint i = j; i < K; i++) {
+            float v = sLU[i * K + j];
+            float av = v < 0 ? -v : v;
+            if (av > max_val) { max_val = av; max_row = i; }
+        }
+        spiv[j] = max_row;
+        if (max_row != j) {
+            for (uint c = 0; c < K; c++) {
+                float tmp = sLU[j * K + c];
+                sLU[j * K + c] = sLU[max_row * K + c];
+                sLU[max_row * K + c] = tmp;
+            }
+        }
+        float diag = sLU[j * K + j];
+        if (diag != 0.0f) {
+            float inv_diag = 1.0f / diag;
+            for (uint i = j + 1; i < K; i++)
+                sLU[i * K + j] *= inv_diag;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Parallel column update: each thread handles one column c > j
+    for (uint c = j + 1 + tid; c < K; c += K) {
+        for (uint i = j + 1; i < K; i++)
+            sLU[i * K + c] -= sLU[i * K + j] * sLU[j * K + c];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Write LU to device memory + pivot
+for (uint j = tid; j < K; j += K)
+    for (uint i = 0; i < K; i++)
+        LU[base + i * K + j] = sLU[i * K + j];
+if (tid < K) piv[tg_id * K + tid] = spiv[tid];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+// Solve (thread 0 only — sequential per RHS)
+if (tid == 0) {
+    uint bbase = tg_id * K * M;
+    for (uint col = 0; col < M; col++) {
+        float y[80];
+        for (uint i = 0; i < K; i++) y[i] = b[bbase + i * M + col];
+        for (uint i = 0; i < K; i++) {
+            uint pi = spiv[i];
+            if (pi != i) { float tmp = y[i]; y[i] = y[pi]; y[pi] = tmp; }
+        }
+        for (uint i = 1; i < K; i++)
+            for (uint p = 0; p < i; p++)
+                y[i] -= sLU[i * K + p] * y[p];
+        for (int i = (int)K - 1; i >= 0; i--) {
+            for (uint p = (uint)i + 1; p < K; p++)
+                y[(uint)i] -= sLU[(uint)i * K + p] * y[p];
+            y[(uint)i] /= sLU[(uint)i * K + (uint)i];
+        }
+        for (uint i = 0; i < K; i++) x[bbase + i * M + col] = y[i];
+    }
+}
+"""
+
+# Large single-thread LU kernel (any k). Uses device-memory scratch for y
+# to avoid Metal compiler bugs with thread-local arrays at certain sizes.
+_LU_SOLVE_LG_SRC = """
+uint bid = thread_position_in_grid.x;
+if (bid >= BATCH) return;
+
+uint base = bid * K * K;
+
+for (uint i = 0; i < K; i++)
+    for (uint j = 0; j < K; j++)
+        LU[base + i * K + j] = A[base + i * K + j];
+
+uint pbase = bid * K;
+
+for (uint j = 0; j < K; j++) {
+    float max_val = 0.0f;
+    uint max_row = j;
+    for (uint i = j; i < K; i++) {
+        float v = LU[base + i * K + j];
+        float av = v < 0 ? -v : v;
+        if (av > max_val) { max_val = av; max_row = i; }
+    }
+    piv[pbase + j] = max_row;
+    if (max_row != j) {
+        for (uint c = 0; c < K; c++) {
+            float tmp = LU[base + j * K + c];
+            LU[base + j * K + c] = LU[base + max_row * K + c];
+            LU[base + max_row * K + c] = tmp;
+        }
+    }
+    float diag = LU[base + j * K + j];
+    if (diag != 0.0f) {
+        float inv_diag = 1.0f / diag;
+        for (uint i = j + 1; i < K; i++) {
+            LU[base + i * K + j] *= inv_diag;
+            for (uint c = j + 1; c < K; c++)
+                LU[base + i * K + c] -= LU[base + i * K + j] * LU[base + j * K + c];
+        }
+    }
+}
+
+// Solve using scratch buffer (device memory) instead of thread-local y[]
+uint bbase = bid * K * M;
+uint ybase = bid * K;  // scratch buffer offset
+for (uint col = 0; col < M; col++) {
+    for (uint i = 0; i < K; i++) scratch[ybase + i] = b[bbase + i * M + col];
+    for (uint i = 0; i < K; i++) {
+        uint pi = piv[pbase + i];
+        if (pi != i) {
+            float tmp = scratch[ybase + i];
+            scratch[ybase + i] = scratch[ybase + pi];
+            scratch[ybase + pi] = tmp;
+        }
+    }
+    for (uint i = 1; i < K; i++)
+        for (uint p = 0; p < i; p++)
+            scratch[ybase + i] -= LU[base + i * K + p] * scratch[ybase + p];
+    for (int i = (int)K - 1; i >= 0; i--) {
+        for (uint p = (uint)i + 1; p < K; p++)
+            scratch[ybase + (uint)i] -= LU[base + (uint)i * K + p] * scratch[ybase + p];
+        scratch[ybase + (uint)i] /= LU[base + (uint)i * K + (uint)i];
+    }
+    for (uint i = 0; i < K; i++) x[bbase + i * M + col] = scratch[ybase + i];
+}
+"""
+
+
+def solve_lu(A: mx.array, b: mx.array) -> mx.array:
+    """
+    Solve A @ x = b using LU with partial pivoting on GPU.
+
+    Handles ANY square matrix (not just SPD). More robust than Cholesky
+    for ill-conditioned or non-SPD matrices.
+
+    Args:
+        A: (batch, k, k) square matrices (k <= 128)
+        b: (batch, k, m) or (batch, k) right-hand sides
+
+    Returns:
+        x: same shape as b
+    """
+    batch, k = A.shape[0], A.shape[1]
+    assert k <= MAX_GPU_K, f"Matrix size {k} exceeds GPU limit {MAX_GPU_K}"
+
+    A_flat = mx.reshape(A.astype(mx.float32), (-1,))
+    b_flat, m, was_2d = _prep_b(b)
+
+    grid = (batch, 1, 1)
+    threadgroup = (min(256, batch), 1, 1)
+
+    if k <= 32:
+        # Small k: thread-local y[32] is safe
+        kernel = _get_kernel(
+            f"lu_solve_{k}_{m}", ["A", "b"], ["LU", "piv", "x"],
+            _LU_SOLVE_SRC,
+        )
+        _, _, x_flat = kernel(
+            inputs=[A_flat, b_flat],
+            template=[("K", k), ("M", m), ("BATCH", batch)],
+            grid=grid, threadgroup=threadgroup,
+            output_shapes=[(batch * k * k,), (batch * k,), (batch * k * m,)],
+            output_dtypes=[mx.float32, mx.uint32, mx.float32],
+        )
+    else:
+        # Large k: use device-memory scratch to avoid Metal compiler bugs
+        kernel = _get_kernel(
+            f"lu_solve_lg_{k}_{m}", ["A", "b"],
+            ["LU", "piv", "scratch", "x"], _LU_SOLVE_LG_SRC,
+        )
+        _, _, _, x_flat = kernel(
+            inputs=[A_flat, b_flat],
+            template=[("K", k), ("M", m), ("BATCH", batch)],
+            grid=grid, threadgroup=threadgroup,
+            output_shapes=[
+                (batch * k * k,), (batch * k,),
+                (batch * k,), (batch * k * m,),
+            ],
+            output_dtypes=[mx.float32, mx.uint32, mx.float32, mx.float32],
+        )
+    return _unpack(x_flat, batch, k, m, was_2d)
+
+
+# Alias for backward compatibility
+solve_cholesky = solve

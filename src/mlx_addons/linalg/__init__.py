@@ -32,6 +32,8 @@ Functions:
 
 from ._blocked import blocked_cholesky, blocked_solve
 from ._metal_kernels import (
+    solve_cholesky,
+    solve_lu,
     tril_solve,
     triu_solve,
     qr,
@@ -47,6 +49,8 @@ cholesky = blocked_cholesky
 __all__ = [
     "solve",
     "cholesky",
+    "solve_cholesky",
+    "solve_lu",
     "qr",
     "tril_solve",
     "triu_solve",
