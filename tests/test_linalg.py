@@ -4,7 +4,7 @@ import mlx.core as mx
 import numpy as np
 import pytest
 
-from mlx_addons.linalg import solve, cholesky, tril_solve, triu_solve
+from mlx_addons.linalg import solve, cholesky, tril_solve, triu_solve, qr
 from mlx_addons.linalg import det, slogdet, logdet_spd
 
 
@@ -163,3 +163,62 @@ class TestDet:
         ld_np = np.array(ld).astype(np.float64)
         err = np.max(np.abs(ld_np - logdet_ref))
         assert err < 0.1, f"n={n}: logdet_spd error {err:.2e}"
+
+
+# ============================================================
+# QR factorization
+# ============================================================
+
+
+class TestQR:
+    @pytest.mark.parametrize("k", [3, 5, 8, 10, 16, 20, 32])
+    def test_accuracy_vs_cpu(self, k):
+        """GPU QR reconstruction: ||A - QR|| < tol."""
+        rng = np.random.default_rng(42)
+        A_np = rng.standard_normal((50, k, k)).astype(np.float32)
+        A = mx.array(A_np)
+
+        Q_gpu, R_gpu = qr(A)
+        mx.eval(Q_gpu, R_gpu)
+
+        recon = Q_gpu @ R_gpu
+        mx.eval(recon)
+        err = np.max(np.abs(np.array(recon) - A_np))
+        assert err < 1e-3, f"k={k}: reconstruction error {err:.2e}"
+
+    @pytest.mark.parametrize("k", [3, 8, 16])
+    def test_orthogonality(self, k):
+        """Q^T Q should be identity."""
+        rng = np.random.default_rng(123)
+        A = mx.array(rng.standard_normal((100, k, k)).astype(np.float32))
+        Q, _ = qr(A)
+        mx.eval(Q)
+        QtQ = Q.swapaxes(-2, -1) @ Q
+        mx.eval(QtQ)
+        eye = np.eye(k, dtype=np.float32)
+        err = np.max(np.abs(np.array(QtQ) - eye))
+        assert err < 1e-3, f"k={k}: orthogonality error {err:.2e}"
+
+    @pytest.mark.parametrize("k", [3, 8, 16])
+    def test_upper_triangular(self, k):
+        """R should be upper triangular."""
+        rng = np.random.default_rng(77)
+        A = mx.array(rng.standard_normal((20, k, k)).astype(np.float32))
+        _, R = qr(A)
+        mx.eval(R)
+        R_np = np.array(R)
+        for i in range(k):
+            for j in range(i):
+                assert np.all(np.abs(R_np[:, i, j]) < 1e-4), \
+                    f"R not upper triangular at ({i},{j})"
+
+    def test_single_matrix(self):
+        """2D input (no batch dimension)."""
+        rng = np.random.default_rng(99)
+        A = mx.array(rng.standard_normal((10, 10)).astype(np.float32))
+        Q, R = qr(A)
+        mx.eval(Q, R)
+        assert Q.shape == (10, 10)
+        assert R.shape == (10, 10)
+        err = np.max(np.abs(np.array(Q @ R) - np.array(A)))
+        assert err < 1e-3
