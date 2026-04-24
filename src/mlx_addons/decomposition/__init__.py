@@ -17,5 +17,18 @@ from ._pca import PCA
 from ._nystroem import Nystroem
 from ._kernel_pca import KernelPCA
 from ._kernels import pairwise_kernel
+from ._random_projection import (
+    GaussianRandomProjection,
+    SparseRandomProjection,
+    johnson_lindenstrauss_min_dim,
+)
 
-__all__ = ["PCA", "Nystroem", "KernelPCA", "pairwise_kernel"]
+__all__ = [
+    "PCA",
+    "Nystroem",
+    "KernelPCA",
+    "pairwise_kernel",
+    "GaussianRandomProjection",
+    "SparseRandomProjection",
+    "johnson_lindenstrauss_min_dim",
+]

@@ -42,6 +42,7 @@ from ._metal_kernels import (
 )
 from ._det import det, slogdet, logdet_spd
 from ._svd import randomized_svd, TruncatedSVD
+from ._sparse import csr_matmul, csr_from_dense
 
 # Public API: solve and cholesky handle any matrix size
 solve = blocked_solve
@@ -60,6 +61,8 @@ __all__ = [
     "logdet_spd",
     "randomized_svd",
     "TruncatedSVD",
+    "csr_matmul",
+    "csr_from_dense",
     "MAX_GPU_K",
     "SHARED_K_MAX",
 ]
