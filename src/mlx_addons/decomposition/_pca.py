@@ -81,12 +81,23 @@ class PCA:
         self.random_state = random_state
 
     def fit(self, X: Union[np.ndarray, "mx.array"], y=None) -> "PCA":
+        """Fit PCA.
+
+        ``X`` can be 2-D ``(n_samples, n_features)`` — standard sklearn behaviour —
+        or 3-D ``(batch, n_samples, n_features)``, in which case one independent
+        PCA is fit per batch element in a single Metal dispatch and all stateful
+        attributes (``components_``, ``mean_``, ``explained_variance_`` …) grow
+        a leading batch dimension.
+        """
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-        if X.ndim != 2:
-            raise ValueError(f"PCA expects 2-D input, got shape {X.shape}")
-        n_samples, n_features = X.shape
-        self.mean_ = X.mean(axis=0)
-        Xc = X - self.mean_
+        if X.ndim not in (2, 3):
+            raise ValueError(f"PCA expects 2-D or 3-D input, got shape {X.shape}")
+        self._batched = (X.ndim == 3)
+        axis_samples = -2
+        self.mean_ = X.mean(axis=axis_samples)                   # (n_features,) or (batch, n_features)
+        Xc = X - np.expand_dims(self.mean_, axis=axis_samples)
+        n_samples = X.shape[axis_samples]
+        n_features = X.shape[-1]
 
         k = min(self.n_components, n_samples, n_features)
         _U, S, Vt = randomized_svd(
@@ -102,19 +113,32 @@ class PCA:
         # sklearn convention: explained_variance_ = S**2 / (n_samples - 1)
         denom = max(n_samples - 1, 1)
         self.explained_variance_ = (S ** 2) / denom
-        # Total variance used as denominator for the ratio (same as sklearn).
-        total_var = float(np.sum(Xc ** 2)) / denom
-        self.explained_variance_ratio_ = self.explained_variance_ / max(total_var, 1e-20)
+        # Total variance per (batch, feature) — sum over samples axis.
+        total_var = np.sum(Xc ** 2, axis=(axis_samples, -1)) / denom
+        if self._batched:
+            self.explained_variance_ratio_ = self.explained_variance_ / np.maximum(total_var, 1e-20)[:, None]
+        else:
+            self.explained_variance_ratio_ = self.explained_variance_ / max(float(total_var), 1e-20)
         self.n_samples_ = n_samples
         self.n_features_in_ = n_features
         return self
 
     def transform(self, X: Union[np.ndarray, "mx.array"]) -> np.ndarray:
+        """Project X onto the fitted principal components.
+
+        Mirrors the dimensionality used at ``fit`` time: 2-D fit → 2-D transform,
+        3-D fit → 3-D transform. For 3-D the batch dim must match ``components_``'s.
+        """
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-        Xc = X - self.mean_
-        Z = Xc @ self.components_.T
+        Xc = X - np.expand_dims(self.mean_, axis=-2)
+        if self._batched:
+            # (batch, n, n_features) @ (batch, n_features, k)
+            Z = Xc @ np.swapaxes(self.components_, -2, -1)
+        else:
+            Z = Xc @ self.components_.T
         if self.whiten:
-            Z = Z / np.sqrt(np.maximum(self.explained_variance_, 1e-20))
+            ev = np.maximum(self.explained_variance_, 1e-20)
+            Z = Z / np.expand_dims(np.sqrt(ev), axis=-2)
         return Z
 
     def fit_transform(self, X, y=None) -> np.ndarray:
@@ -123,5 +147,10 @@ class PCA:
     def inverse_transform(self, Z: np.ndarray) -> np.ndarray:
         Z = np.ascontiguousarray(np.asarray(Z, dtype=np.float32))
         if self.whiten:
-            Z = Z * np.sqrt(np.maximum(self.explained_variance_, 1e-20))
-        return Z @ self.components_ + self.mean_
+            ev = np.maximum(self.explained_variance_, 1e-20)
+            Z = Z * np.expand_dims(np.sqrt(ev), axis=-2)
+        if self._batched:
+            X = Z @ self.components_ + np.expand_dims(self.mean_, axis=-2)
+        else:
+            X = Z @ self.components_ + self.mean_
+        return X

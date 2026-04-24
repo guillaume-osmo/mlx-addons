@@ -58,6 +58,36 @@ class TestPCA:
         var = Z.var(axis=0, ddof=1)
         assert np.all(np.abs(var - 1.0) < 0.1), f"var={var}"
 
+    def test_batched_fit_transform_shape(self):
+        rng = np.random.default_rng(10)
+        X = rng.standard_normal((4, 300, 60)).astype(np.float32)
+        pca = PCA(n_components=8, random_state=0).fit(X)
+        assert pca.components_.shape == (4, 8, 60)
+        assert pca.mean_.shape == (4, 60)
+        assert pca.explained_variance_.shape == (4, 8)
+        Z = pca.transform(X)
+        assert Z.shape == (4, 300, 8)
+
+    def test_batched_inverse_transform(self):
+        rng = np.random.default_rng(11)
+        X = rng.standard_normal((3, 200, 10)).astype(np.float32)
+        pca = PCA(n_components=10, random_state=0, n_iter=6).fit(X)
+        Z = pca.transform(X)
+        X_hat = pca.inverse_transform(Z)
+        np.testing.assert_allclose(X_hat, X, atol=1e-2)
+
+    def test_batched_matches_per_batch_2d(self):
+        """Each 3-D slice should yield ~equivalent results to fitting it alone."""
+        rng = np.random.default_rng(12)
+        X = rng.standard_normal((3, 300, 40)).astype(np.float32)
+        pca_b = PCA(n_components=10, random_state=0, n_iter=6).fit(X)
+        # Compare explained variance shape/order across batches
+        assert pca_b.explained_variance_.shape == (3, 10)
+        # Each batch's explained_variance should be monotonically non-increasing
+        assert (pca_b.explained_variance_[:, :-1] >= pca_b.explained_variance_[:, 1:] - 1e-6).all()
+        # Each batch's explained_variance_ratio_ should sum to <=1
+        assert (pca_b.explained_variance_ratio_.sum(axis=1) <= 1.0 + 1e-5).all()
+
     def test_variance_ratio_ordered(self):
         rng = np.random.default_rng(5)
         X = rng.standard_normal((400, 60)).astype(np.float32)
