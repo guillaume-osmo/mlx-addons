@@ -149,6 +149,29 @@ Z = kpca.transform(X_test)
 K = pairwise_kernel(X, Y, kernel="rbf", gamma=0.1)   # (N, M)
 ```
 
+### `mlx_addons.cluster` — Clustering on GPU
+
+#### KMeans (Lloyd's algorithm, k-means++ init)
+
+Assignment = one Metal matmul + ``argmin``; update = one-hot ``.T @ X`` matmul. No custom kernels — the whole Lloyd loop is expressed in MLX ops.
+
+| Shape                    | sklearn | **mlx_addons** | speedup |
+|:-------------------------|--------:|---------------:|:-------:|
+| n=1000,   d=16,  k=8     |   15 ms |    25 ms       | 0.6×    |
+| n=5000,   d=32,  k=16    |   42 ms |    36 ms       | 1.2×    |
+| n=10000,  d=64,  k=32    |  351 ms |    79 ms       | **4.4×** |
+| n=50000,  d=64,  k=32    |  1.2 s  |   133 ms       | **8.8×** |
+| n=100000, d=128, k=64    |  7.4 s  |   465 ms       | **16×**  |
+
+```python
+from mlx_addons.cluster import KMeans
+
+km = KMeans(n_clusters=32, n_init=3, random_state=0).fit(X)
+labels = km.labels_                 # (n_samples,)
+centers = km.cluster_centers_       # (n_clusters, n_features)
+new_labels = km.predict(X_new)
+```
+
 ### `mlx_addons.knn` — K-Nearest Neighbors on GPU
 
 Z-order tree construction + Metal GPU kernels for batched distance computation and segmented top-k selection. Supports up to **256 neighbors**.
