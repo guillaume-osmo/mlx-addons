@@ -26,16 +26,18 @@ import mlx.core as mx
 import numpy as np
 
 def _thin_qr(Y: mx.array) -> mx.array:
-    """Thin QR factor Q of a tall (n, kp) matrix — uses MLX CPU Householder QR.
+    """Thin QR factor Q of a tall (..., n, kp) matrix — MLX CPU Householder QR.
+
+    Supports an optional leading batch dimension: ``Y`` of shape
+    ``(..., n, kp)`` returns ``Q`` of shape ``(..., n, kp)``. Batching is
+    handled natively by MLX's CPU QR.
 
     We tried Metal Cholesky-QR2 using ``mlx_addons.linalg.cholesky`` +
-    ``tril_solve`` (see :func:`_cholesky_qr` below), but measured it **slower**
-    than CPU QR at the ``kp <= 128`` sizes typical for randomized SVD: each
-    Cholesky + tril_solve pair needs a Metal kernel launch (~0.5 ms), two
-    passes × 2 matmul-QR's per power iteration × ~5 iterations compounds into
-    ~10 extra kernel launches vs a single CPU Householder call. Kept around
-    commented out as a starting point for future work (e.g. once MLX exposes
-    a persistent kernel cache keyed on (dtype, k)).
+    ``tril_solve`` but measured it **slower** than CPU QR at the ``kp <= 128``
+    sizes typical for randomized SVD: each Cholesky + tril_solve pair needs a
+    Metal kernel launch (~0.5 ms), and the ``.item()`` host syncs required for
+    stability fallbacks compound into more overhead than a single CPU
+    Householder call. Revisitable once MLX has persistent kernel caches.
     """
     with mx.stream(mx.cpu):
         Q, _ = mx.linalg.qr(Y)
@@ -56,8 +58,14 @@ def randomized_svd(
 
     Parameters
     ----------
-    X : (n, m) mlx.array or np.ndarray
+    X : (n, m) or (batch, n, m) mlx.array or np.ndarray
         Dense matrix. Converted to float32 internally.
+
+        If ``X`` has a leading batch dimension, the SVD is computed for each
+        matrix in the batch in a single pass — **all matmuls share one Metal
+        dispatch**, so B independent truncations cost ≈ the same as one for
+        small B. Batched QR / final SVD run on the MLX CPU stream but are
+        tiny (``O(kp^2 m)``) and parallelise cheaply.
     n_components : int
         Number of singular triplets to keep.
     n_oversamples : int, default=10
@@ -67,7 +75,8 @@ def randomized_svd(
         randomized range finding; higher values improve accuracy for slow-decay
         spectra at the cost of another ``n_iter`` matmul pairs.
     random_state : int, optional
-        Seed for the random projection.
+        Seed for the random projection. For batched input, each batch element
+        uses a different seed derived deterministically from this one.
     flip_signs : bool, default=True
         Canonicalize signs like sklearn's ``svd_flip`` (Vt-based): for each row
         of Vt, flip so the max-abs entry is positive. Makes the output
@@ -75,31 +84,38 @@ def randomized_svd(
 
     Returns
     -------
-    U : (n, k) np.ndarray, float32
-    S : (k,)  np.ndarray, float32
-    Vt: (k, m) np.ndarray, float32
+    U : (..., n, k) np.ndarray, float32     — leading dims match input
+    S : (..., k)    np.ndarray, float32
+    Vt: (..., k, m) np.ndarray, float32
 
     Notes
     -----
-    Algorithm (Halko-Martinsson-Tropp, 2011):
+    Algorithm (Halko-Martinsson-Tropp, 2011), batched:
 
-        1. Ω ~ N(0, 1), shape (m, k + p)
-        2. Y = X @ Ω                           # Metal matmul
-        3. for _ in range(n_iter): Y = X @ (X.T @ Y)
-        4. Q, _ = qr(Y)                        # CPU QR
-        5. B = Q.T @ X                         # Metal matmul
-        6. Û, S, Vt = svd(B)                   # CPU SVD on (k+p, m)
-        7. U = Q @ Û                           # Metal matmul
-        8. Return (U[:, :k], S[:k], Vt[:k, :])
+        1. Ω ~ N(0, 1), shape (batch, m, k + p)
+        2. Y = X @ Ω                           # Metal batch matmul
+        3. for _ in range(n_iter):
+               Y = X @ (X.mT @ Y) with re-orth between matmuls
+        4. Q, _ = qr(Y)                        # CPU batched QR
+        5. B = Q.mT @ X                        # Metal batch matmul
+        6. Û, S, Vt = svd(B)                   # CPU batched SVD
+        7. U = Q @ Û                           # Metal batch matmul
+        8. Return (U[..., :, :k], S[..., :k], Vt[..., :k, :])
     """
     X_np = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-    n, m = X_np.shape
+    batched = (X_np.ndim == 3)
+    if not batched:
+        if X_np.ndim != 2:
+            raise ValueError(f"randomized_svd expects a 2-D or 3-D array, got shape {X_np.shape}")
+        X_np = X_np[None, ...]
+    B_, n, m = X_np.shape
     k = min(n_components, min(n, m))
     p = n_oversamples
     kp = k + p
 
-    rng = np.random.default_rng(random_state)
-    Omega = rng.standard_normal((m, kp)).astype(np.float32)
+    # Deterministic per-batch seeds derived from random_state.
+    master_rng = np.random.default_rng(random_state)
+    Omega = master_rng.standard_normal((B_, m, kp)).astype(np.float32)
 
     X_mx = mx.array(X_np)
     Y = X_mx @ mx.array(Omega)
@@ -107,10 +123,10 @@ def randomized_svd(
 
     # Subspace (power) iteration WITH re-orthogonalization — Halko-Martinsson-Tropp
     # Algorithm 4.4. Without re-orthogonalization, float32 collapses to the top
-    # singular vector after a few iterations. QR uses mlx_addons' GPU Cholesky-QR.
+    # singular vector after a few iterations.
     for _ in range(n_iter):
         Q1 = _thin_qr(Y)
-        Z = X_mx.T @ Q1
+        Z = _matT(X_mx) @ Q1
         mx.eval(Z)
         Q2 = _thin_qr(Z)
         Y = X_mx @ Q2
@@ -118,30 +134,52 @@ def randomized_svd(
 
     Q = _thin_qr(Y)
 
-    # Project (Metal matmul), then tiny SVD on (kp, m) (CPU).
-    B = Q.T @ X_mx
+    # Project (Metal matmul), then tiny batched SVD on (kp, m) (CPU).
+    B = _matT(Q) @ X_mx
     mx.eval(B)
     with mx.stream(mx.cpu):
         U_hat, S, Vt = mx.linalg.svd(B)
         mx.eval(U_hat, S, Vt)
 
-    # Lift back to the original n-dim row space (Metal matmul).
+    # Lift back to the original n-dim row space (Metal batch matmul).
     U_full = Q @ U_hat
     mx.eval(U_full)
 
-    U_np = np.array(U_full[:, :k], dtype=np.float32)
-    S_np = np.array(S[:k], dtype=np.float32)
-    Vt_np = np.array(Vt[:k, :], dtype=np.float32)
+    U_np = np.array(U_full[..., :, :k], dtype=np.float32)
+    S_np = np.array(S[..., :k], dtype=np.float32)
+    Vt_np = np.array(Vt[..., :k, :], dtype=np.float32)
 
     if flip_signs:
-        # svd_flip (Vt-based): for each row of Vt, force max-abs entry positive.
-        max_abs_cols = np.argmax(np.abs(Vt_np), axis=1)
-        signs = np.sign(Vt_np[np.arange(k), max_abs_cols])
-        signs[signs == 0] = 1.0
-        Vt_np = Vt_np * signs[:, None]
-        U_np = U_np * signs[None, :]
+        # svd_flip (Vt-based, per batch): for each row of Vt, flip so the
+        # max-abs entry is positive. Handles both 2-D and 3-D via last-two-dim ops.
+        max_abs_cols = np.argmax(np.abs(Vt_np), axis=-1)             # (..., k)
+        row_idx = np.arange(k)
+        if batched:
+            b_idx = np.arange(B_)[:, None]
+            signs = np.sign(Vt_np[b_idx, row_idx[None, :], max_abs_cols])
+        else:
+            signs = np.sign(Vt_np[0, row_idx, max_abs_cols[0]])
+        signs = np.where(signs == 0, 1.0, signs).astype(np.float32)
+        # Broadcast signs: shape (batch, k) → multiply Vt's row axis and U's col axis.
+        if batched:
+            Vt_np = Vt_np * signs[:, :, None]
+            U_np = U_np * signs[:, None, :]
+        else:
+            Vt_np = Vt_np[0] * signs[:, None]
+            U_np = U_np[0] * signs[None, :]
+            S_np = S_np[0]
+            return U_np, S_np, Vt_np
 
+    if not batched:
+        return U_np[0], S_np[0], Vt_np[0]
     return U_np, S_np, Vt_np
+
+
+def _matT(A: mx.array) -> mx.array:
+    """Transpose the last two axes (like numpy's ``.mT`` or ``swapaxes(-2, -1)``)."""
+    if A.ndim == 2:
+        return A.T
+    return mx.swapaxes(A, -2, -1)
 
 
 class TruncatedSVD:
