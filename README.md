@@ -149,6 +149,44 @@ Z = kpca.transform(X_test)
 K = pairwise_kernel(X, Y, kernel="rbf", gamma=0.1)   # (N, M)
 ```
 
+#### Random projection (Johnson-Lindenstrauss)
+
+sklearn-compatible ``GaussianRandomProjection`` and ``SparseRandomProjection`` (Achlioptas / Li). Projection is one Metal matmul; ``SparseRandomProjection`` can optionally keep its matrix in CSR format (``store_sparse=True``) for downstream GNN-shape SpMM, but the dense path is faster at RP-typical shapes (small ``k``, large ``n_samples``).
+
+| shape                    | k   | sklearn Gaussian | **ours** | speedup |
+|:-------------------------|----:|-----------------:|---------:|--------:|
+| n=5000,  d=2048          | 128 |            17 ms |   **8 ms** |  **2.2×** |
+| n=10000, d=4096          | 128 |            56 ms |  **12 ms** |  **4.6×** |
+| n=1000,  d=16384         | 256 |            98 ms |  **32 ms** |  **3.1×** |
+
+```python
+from mlx_addons.decomposition import GaussianRandomProjection, SparseRandomProjection, johnson_lindenstrauss_min_dim
+
+# k chosen automatically to preserve pairwise distances to (1 ± eps)
+rp = GaussianRandomProjection(n_components="auto", eps=0.2, random_state=0).fit(X)
+Z = rp.transform(X)
+
+# Ternary {-s, 0, +s} sparse matrix (Achlioptas density = 1/sqrt(d) by default)
+rp = SparseRandomProjection(n_components=128, random_state=0).fit(X)
+```
+
+#### Sparse matmul (CSR × dense) on Metal
+
+A general-purpose SpMM primitive, not tied to random projection. One Metal thread per output element; scales with ``nnz``, not ``M × K``. Dramatic wins on highly-sparse wide inputs (think graph Laplacians, GNN message passing, one-hot feature matrices):
+
+| (M, K, N) | density | nnz | dense matmul | **csr_matmul** | speedup |
+|:----------|:-------:|----:|-------------:|---------------:|--------:|
+| (1000, 2048, 64)    | 2.0% |   41k |   1.5 ms |  **0.1 ms** |   **27×** |
+| (1000, 8192, 64)    | 1.0% |   82k |   8.8 ms |  **0.1 ms** |  **167×** |
+| (5000, 16384, 64)   | 0.5% |  409k |    65 ms |  **0.1 ms** |  **535×** |
+| (10000, 32768, 128) | 0.2% |  655k |   219 ms |  **0.4 ms** |  **622×** |
+
+```python
+from mlx_addons.linalg import csr_matmul, csr_from_dense
+indptr, indices, values = csr_from_dense(A)       # (M, K) dense → CSR
+C = csr_matmul(indptr, indices, values, B, M=A.shape[0])   # (M, K) @ (K, N) → (M, N)
+```
+
 ### `mlx_addons.cluster` — Clustering on GPU
 
 #### KMeans (Lloyd's algorithm, k-means++ init)
