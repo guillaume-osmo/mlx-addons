@@ -14,5 +14,8 @@ Usage::
 """
 
 from ._pca import PCA
+from ._nystroem import Nystroem
+from ._kernel_pca import KernelPCA
+from ._kernels import pairwise_kernel
 
-__all__ = ["PCA"]
+__all__ = ["PCA", "Nystroem", "KernelPCA", "pairwise_kernel"]

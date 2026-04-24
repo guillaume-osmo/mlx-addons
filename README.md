@@ -120,6 +120,35 @@ X_hat = pca.inverse_transform(Z)         # lossy reconstruction
 print(pca.explained_variance_ratio_)     # descending
 ```
 
+#### Nyström kernel approximation + KernelPCA
+
+Drop-in replacements for ``sklearn.kernel_approximation.Nystroem`` and ``sklearn.decomposition.KernelPCA``. Kernel matrix construction (RBF / polynomial / linear / sigmoid) runs via Metal matmul: one ``X @ Y.T`` for the pairwise inner products plus elementwise ops for the kernel function. Eigendecomposition on the small (m × m) or (n × n) kernel matrix runs on MLX CPU stream via ``mx.linalg.eigh``.
+
+| Method | shape | sklearn | **mlx_addons** | speedup |
+|:-------|:------|--------:|---------------:|:-------:|
+| Nystroem   | n=1000, d=20,  m=100  | 233 ms | **2 ms**  | **109×** |
+| Nystroem   | n=5000, d=50,  m=300  | 332 ms | **6 ms**  | **54×**  |
+| Nystroem   | n=10000, d=100, m=500 | 388 ms | **14 ms** | **27×**  |
+| KernelPCA  | n=500,  d=10, k=20    | 310 ms | **20 ms** | **16×**  |
+| KernelPCA  | n=1500, d=30, k=40    | 505 ms | **134 ms**| **3.8×** |
+| KernelPCA  | n=3000, d=50, k=60    | 1.4 s  | **693 ms**| **2.0×** |
+
+```python
+from mlx_addons.decomposition import Nystroem, KernelPCA, pairwise_kernel
+
+# Nyström: φ(x) Metal-accelerated feature map, Z Z.T ≈ K_rbf(X, X)
+ny = Nystroem(n_components=100, kernel="rbf", gamma=0.1).fit(X_train)
+Z_train = ny.transform(X_train)
+Z_test  = ny.transform(X_test)
+
+# Kernel PCA
+kpca = KernelPCA(n_components=16, kernel="rbf", gamma=0.1).fit(X_train)
+Z = kpca.transform(X_test)
+
+# Raw kernel matrix if you need it
+K = pairwise_kernel(X, Y, kernel="rbf", gamma=0.1)   # (N, M)
+```
+
 ### `mlx_addons.knn` — K-Nearest Neighbors on GPU
 
 Z-order tree construction + Metal GPU kernels for batched distance computation and segmented top-k selection. Supports up to **256 neighbors**.
