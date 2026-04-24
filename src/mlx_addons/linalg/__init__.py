@@ -41,6 +41,7 @@ from ._metal_kernels import (
     SHARED_K_MAX,
 )
 from ._det import det, slogdet, logdet_spd
+from ._svd import randomized_svd, TruncatedSVD
 
 # Public API: solve and cholesky handle any matrix size
 solve = blocked_solve
@@ -57,6 +58,8 @@ __all__ = [
     "det",
     "slogdet",
     "logdet_spd",
+    "randomized_svd",
+    "TruncatedSVD",
     "MAX_GPU_K",
     "SHARED_K_MAX",
 ]

@@ -58,6 +58,31 @@ For k > 63, falls back to CPU LAPACK (the threadgroup memory limit of 32 KB fits
 
 **Functions:** `solve`, `cholesky`, `qr`, `tril_solve`, `triu_solve`, `det`, `slogdet`, `logdet_spd`
 
+#### Randomized Truncated SVD (Halko-Martinsson-Tropp)
+
+Metal GPU matmul for the range-finding, projection and lift steps; CPU MLX stream for the QR on the ``(n, k+p)`` basis and the small ``(k+p, m)`` final SVD. Subspace iteration with re-orthogonalization (Halko-Martinsson-Tropp Algorithm 4.4). Dramatically faster than scipy ARPACK for low-rank truncation:
+
+| Matrix shape      | k  | scipy ARPACK | sklearn randomized | MLX full CPU SVD | **mlx_addons rSVD** |
+|:------------------|---:|-------------:|-------------------:|-----------------:|--------------------:|
+| (633, 128)        | 32 |      394 ms  |            501 ms  |           12 ms  |           **8 ms**  |
+| (2000, 512)       | 32 |      13.1 s  |             1.4 s  |           92 ms  |          **12 ms**  |
+| (5000, 1024)      | 64 |      21.6 s  |             3.9 s  |           928 ms |          **46 ms**  |
+| (10000, 2048)     | 32 |  ~30 s†      |             3.4 s  |           4.4 s  |          **59 ms**  |
+
+† ARPACK skipped above 5000×1024 in the default benchmark (takes 30+ s per call). All measurements on M3 Max with ``mx.clear_cache()`` between runs.
+
+```python
+from mlx_addons.linalg import randomized_svd, TruncatedSVD
+
+U, S, Vt = randomized_svd(X, n_components=32, n_iter=4)
+
+# sklearn-compatible class
+svd = TruncatedSVD(n_components=32).fit(X)
+Z = svd.transform(X)         # (n_samples, 32) low-rank projection
+```
+
+**Functions:** `randomized_svd`, `TruncatedSVD`
+
 ### `mlx_addons.knn` — K-Nearest Neighbors on GPU
 
 Z-order tree construction + Metal GPU kernels for batched distance computation and segmented top-k selection. Supports up to **256 neighbors**.
