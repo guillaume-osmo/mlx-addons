@@ -2,6 +2,72 @@
 
 GPU-accelerated operations for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon. Custom Metal compute kernels for operations that are missing or CPU-only in core MLX.
 
+## Patterns & recipes
+
+Three recipes that come up repeatedly — each documented with a measured improvement on real data.
+
+### 1. Swap `sklearn.decomposition.PCA` → `mlx_addons.decomposition.PCA`
+
+Drop-in replacement backed by Metal randomized SVD.
+
+```python
+# Before:
+from sklearn.decomposition import PCA
+# After:
+from mlx_addons.decomposition import PCA
+```
+
+**Measured on ChemeleonSMD fingerprints (35633 × 2048 float32):**
+
+| PCA dim | sklearn PCA | mlx_addons PCA | speedup |
+|--------:|------------:|---------------:|:-------:|
+|      64 |      9.4 s  |        464 ms  | **20×** |
+|     128 |      9.7 s  |        651 ms  | **15×** |
+|     192 |     10.1 s  |        893 ms  | **11×** |
+
+### 2. Ensemble random projection for robustness + accuracy
+
+Single PCA is sensitive to noisy top eigenvectors on ill-conditioned data; single random projection has high variance; **averaging a few of each hits a lower RMSE than either alone**.
+
+```python
+from mlx_addons.decomposition import EnsembleRandomProjection, ensemble_mean_predict
+
+ens = EnsembleRandomProjection(
+    n_components=128, n_pca=1, n_sparse=2, n_gaussian=2, random_state=42,
+).fit(X_all_molecules)     # global, unsupervised
+
+def fit_predict(Ztr, ytr, Zte):
+    return TabICLRegressorMLX(n_estimators=8, random_state=42).fit(Ztr, ytr).predict(Zte).flatten()
+
+y_pred = ensemble_mean_predict(ens, fit_predict, X_train, y_train, X_test)
+```
+
+**MoleculeACE ChemeleonSMD v5 × PCA=128 × TabICL-MLX (first 10 targets, mean RMSE):**
+
+| Feature transform               | Mean RMSE | Δ vs PCA |
+|---------------------------------|----------:|---------:|
+| PCA (single)                    | 0.6281    | —        |
+| SparseRP × 5                    | 0.6239    | −0.0042  |
+| GaussianRP × 5                  | 0.6241    | −0.0040  |
+| **PCA + 2 SRP + 2 GRP (mix)**   | **0.6215**| **−0.0066** |
+
+Why it works — PCA captures high-variance directions; RPs preserve distances uniformly (JL lemma); averaging cancels per-basis variance. See [`benchmarks/bench_ensemble_rp.py`](benchmarks/bench_ensemble_rp.py).
+
+### 3. Use `csr_matmul` when your left operand is sparse + wide
+
+Writing `A @ B` as dense in MLX gives Metal's optimized GEMM but does all the zero multiplies. For genuine sparse workloads (graph Laplacians, message passing, one-hot features), the CSR path skips them.
+
+```python
+from mlx_addons.linalg import csr_matmul, csr_from_dense
+
+indptr, indices, values = csr_from_dense(A)
+C = csr_matmul(indptr, indices, values, B, M=A.shape[0])
+```
+
+Measured up to **622× faster than dense matmul** at 0.2% density on (10000, 32768) × (32768, 128). Scales with ``nnz``, not ``M × K``.
+
+---
+
 ## Features
 
 ### `mlx_addons.linalg` — Batched Linear Algebra on GPU
@@ -169,6 +235,34 @@ Z = rp.transform(X)
 # Ternary {-s, 0, +s} sparse matrix (Achlioptas density = 1/sqrt(d) by default)
 rp = SparseRandomProjection(n_components=128, random_state=0).fit(X)
 ```
+
+#### EnsembleRandomProjection — mixed PCA + RP ensemble
+
+```python
+from mlx_addons.decomposition import EnsembleRandomProjection, ensemble_mean_predict
+
+ens = EnsembleRandomProjection(
+    n_components=128, n_pca=1, n_sparse=2, n_gaussian=2, random_state=42,
+).fit(X_all)                                    # fits 5 feature maps at once
+Z = ens.transform(X_all)                        # (5, n_samples, 128) stacked views
+
+# Typical pattern: fit your regressor on each member, average predictions.
+def fit_predict(Ztr, ytr, Zte):
+    return YourRegressor(...).fit(Ztr, ytr).predict(Zte)
+
+y_pred = ensemble_mean_predict(ens, fit_predict, X_train, y_train, X_test)
+```
+
+**Measured improvement on MoleculeACE** (ChemeleonSMD v5 fingerprints → 128-d → TabICL-MLX, first 10 targets):
+
+| Feature transform | Mean RMSE | Δ vs PCA |
+|:------------------|----------:|---------:|
+| PCA (single)                    | 0.6281 | — |
+| SparseRP × 5 (seeds averaged)   | 0.6239 | −0.0042 |
+| GaussianRP × 5                  | 0.6241 | −0.0040 |
+| **PCA + 2 SRP + 2 GRP (default recipe)** | **0.6215** | **−0.0066** ✅ |
+
+PCA wins individually on large, well-conditioned datasets (CHEMBL204, 214); RP ensembles win on small / ill-conditioned ones (CHEMBL1871 −0.028, CHEMBL1862 −0.034). The mix captures both sides.
 
 #### Sparse matmul (CSR × dense) on Metal
 
