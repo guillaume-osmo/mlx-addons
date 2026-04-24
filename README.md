@@ -120,6 +120,58 @@ X_hat = pca.inverse_transform(Z)         # lossy reconstruction
 print(pca.explained_variance_ratio_)     # descending
 ```
 
+#### Nyström kernel approximation + KernelPCA
+
+Drop-in replacements for ``sklearn.kernel_approximation.Nystroem`` and ``sklearn.decomposition.KernelPCA``. Kernel matrix construction (RBF / polynomial / linear / sigmoid) runs via Metal matmul: one ``X @ Y.T`` for the pairwise inner products plus elementwise ops for the kernel function. Eigendecomposition on the small (m × m) or (n × n) kernel matrix runs on MLX CPU stream via ``mx.linalg.eigh``.
+
+| Method | shape | sklearn | **mlx_addons** | speedup |
+|:-------|:------|--------:|---------------:|:-------:|
+| Nystroem   | n=1000, d=20,  m=100  | 233 ms | **2 ms**  | **109×** |
+| Nystroem   | n=5000, d=50,  m=300  | 332 ms | **6 ms**  | **54×**  |
+| Nystroem   | n=10000, d=100, m=500 | 388 ms | **14 ms** | **27×**  |
+| KernelPCA  | n=500,  d=10, k=20    | 310 ms | **20 ms** | **16×**  |
+| KernelPCA  | n=1500, d=30, k=40    | 505 ms | **134 ms**| **3.8×** |
+| KernelPCA  | n=3000, d=50, k=60    | 1.4 s  | **693 ms**| **2.0×** |
+
+```python
+from mlx_addons.decomposition import Nystroem, KernelPCA, pairwise_kernel
+
+# Nyström: φ(x) Metal-accelerated feature map, Z Z.T ≈ K_rbf(X, X)
+ny = Nystroem(n_components=100, kernel="rbf", gamma=0.1).fit(X_train)
+Z_train = ny.transform(X_train)
+Z_test  = ny.transform(X_test)
+
+# Kernel PCA
+kpca = KernelPCA(n_components=16, kernel="rbf", gamma=0.1).fit(X_train)
+Z = kpca.transform(X_test)
+
+# Raw kernel matrix if you need it
+K = pairwise_kernel(X, Y, kernel="rbf", gamma=0.1)   # (N, M)
+```
+
+### `mlx_addons.cluster` — Clustering on GPU
+
+#### KMeans (Lloyd's algorithm, k-means++ init)
+
+Assignment = one Metal matmul + ``argmin``; update = one-hot ``.T @ X`` matmul. No custom kernels — the whole Lloyd loop is expressed in MLX ops.
+
+| Shape                    | sklearn | **mlx_addons** | speedup |
+|:-------------------------|--------:|---------------:|:-------:|
+| n=1000,   d=16,  k=8     |   15 ms |    25 ms       | 0.6×    |
+| n=5000,   d=32,  k=16    |   42 ms |    36 ms       | 1.2×    |
+| n=10000,  d=64,  k=32    |  351 ms |    79 ms       | **4.4×** |
+| n=50000,  d=64,  k=32    |  1.2 s  |   133 ms       | **8.8×** |
+| n=100000, d=128, k=64    |  7.4 s  |   465 ms       | **16×**  |
+
+```python
+from mlx_addons.cluster import KMeans
+
+km = KMeans(n_clusters=32, n_init=3, random_state=0).fit(X)
+labels = km.labels_                 # (n_samples,)
+centers = km.cluster_centers_       # (n_clusters, n_features)
+new_labels = km.predict(X_new)
+```
+
 ### `mlx_addons.knn` — K-Nearest Neighbors on GPU
 
 Z-order tree construction + Metal GPU kernels for batched distance computation and segmented top-k selection. Supports up to **256 neighbors**.
