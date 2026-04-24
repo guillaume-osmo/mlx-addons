@@ -83,6 +83,43 @@ Z = svd.transform(X)         # (n_samples, 32) low-rank projection
 
 **Functions:** `randomized_svd`, `TruncatedSVD`
 
+Batched input is supported: pass an array of shape ``(batch, n, m)`` and all matmuls (``X @ Ω``, ``X.mT @ Y``, ``Q.mT @ X``, ``Q @ Û``) go through a single Metal dispatch. The QR and final SVD run on MLX CPU stream but use batched LAPACK, so B independent low-rank truncations cost much less than B calls. Typical speedups vs a serial Python loop at (n=500, m=128, k=16):
+
+| batch | serial loop | **batched** | speedup |
+|------:|------------:|------------:|--------:|
+|   1   |     3.8 ms  |    5.7 ms   |  0.66×  |
+|   4   |    19.9 ms  |    6.7 ms   |  **3.0×**  |
+|   8   |    34.7 ms  |    9.5 ms   |  **3.6×**  |
+|  16   |    66.3 ms  |   12.2 ms   |  **5.4×**  |
+|  32   |   128.3 ms  |   23.0 ms   |  **5.6×**  |
+
+```python
+# 8 independent truncations in one call
+U, S, Vt = randomized_svd(X_batch, n_components=32)   # X_batch: (8, n, m)
+```
+
+### `mlx_addons.decomposition` — sklearn-style decompositions on GPU
+
+#### Randomized PCA
+
+Drop-in replacement for ``sklearn.decomposition.PCA`` backed by `randomized_svd`: mean-centering + Metal-accelerated SVD. Supports `transform` / `inverse_transform` / `whiten` / `explained_variance_ratio_`.
+
+| Matrix shape      | k  | sklearn full | sklearn randomized | **mlx_addons PCA** |
+|:------------------|---:|-------------:|-------------------:|-------------------:|
+| (633, 128)        | 32 |     13 ms    |            371 ms  |          **8 ms**  |
+| (2000, 512)       | 32 |    137 ms    |           3.7 s    |         **18 ms**  |
+| (5000, 1024)      | 64 |    664 ms    |           7.4 s    |         **48 ms**  |
+| (10000, 2048)     | 32 |    4.0 s     |           6.8 s    |         **85 ms**  |
+
+```python
+from mlx_addons.decomposition import PCA
+
+pca = PCA(n_components=32, whiten=False, random_state=0).fit(X)
+Z = pca.transform(X_new)                 # (n_samples, 32)
+X_hat = pca.inverse_transform(Z)         # lossy reconstruction
+print(pca.explained_variance_ratio_)     # descending
+```
+
 ### `mlx_addons.knn` — K-Nearest Neighbors on GPU
 
 Z-order tree construction + Metal GPU kernels for batched distance computation and segmented top-k selection. Supports up to **256 neighbors**.

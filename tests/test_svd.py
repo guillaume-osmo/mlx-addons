@@ -75,6 +75,50 @@ class TestRandomizedSVD:
         gram = U.T @ U
         assert np.abs(gram - np.eye(20)).max() < 1e-3
 
+    def test_batched_shape(self):
+        rng = np.random.default_rng(31)
+        X = rng.standard_normal((5, 300, 60)).astype(np.float32)
+        U, S, Vt = randomized_svd(X, n_components=8, random_state=0)
+        assert U.shape == (5, 300, 8)
+        assert S.shape == (5, 8)
+        assert Vt.shape == (5, 8, 60)
+
+    def test_batched_matches_exact_sv(self):
+        """Each batch element's top-k singular values match the exact SVD."""
+        rng = np.random.default_rng(32)
+        batch, n, m, true_rank, k = 4, 300, 60, 20, 12
+        X_list, S_exact_list = [], []
+        for _ in range(batch):
+            U_true, _ = np.linalg.qr(rng.standard_normal((n, true_rank)).astype(np.float32))
+            Vt_true, _ = np.linalg.qr(rng.standard_normal((m, true_rank)).astype(np.float32))
+            Vt_true = Vt_true.T
+            S_true = (10.0 * np.exp(-0.2 * np.arange(true_rank))).astype(np.float32)
+            X_list.append((U_true * S_true) @ Vt_true)
+            S_exact_list.append(np.linalg.svd(X_list[-1], compute_uv=False)[:k])
+        X = np.stack(X_list)
+        S_exact = np.stack(S_exact_list)
+
+        _U, S, _Vt = randomized_svd(X, n_components=k, n_iter=6, random_state=0)
+        relerr = np.abs(S - S_exact) / S_exact
+        assert relerr.max() < 5e-2, f"max rel err = {relerr.max():.3e}"
+
+    def test_batched_reconstruction_per_matrix(self):
+        rng = np.random.default_rng(33)
+        batch, n, m, true_rank, k = 6, 400, 80, 24, 10
+        X_list = []
+        for _ in range(batch):
+            U_true, _ = np.linalg.qr(rng.standard_normal((n, true_rank)).astype(np.float32))
+            Vt_true, _ = np.linalg.qr(rng.standard_normal((m, true_rank)).astype(np.float32))
+            Vt_true = Vt_true.T
+            S_true = (10.0 * np.exp(-0.3 * np.arange(true_rank))).astype(np.float32)
+            X_list.append((U_true * S_true) @ Vt_true)
+        X = np.stack(X_list)
+        U, S, Vt = randomized_svd(X, n_components=k, n_iter=6, random_state=0)
+        for i in range(batch):
+            rec = U[i] @ np.diag(S[i]) @ Vt[i]
+            relerr = np.linalg.norm(X[i] - rec, "fro") / np.linalg.norm(X[i], "fro")
+            assert relerr < 0.1, f"batch {i}: relerr={relerr:.3e}"
+
 
 class TestTruncatedSVDClass:
     def test_fit_transform_shape(self):
