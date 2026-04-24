@@ -26,14 +26,16 @@ import mlx.core as mx
 import numpy as np
 
 def _thin_qr(Y: mx.array) -> mx.array:
-    """Thin QR factor Q of a tall (n, kp) matrix — uses MLX CPU QR.
+    """Thin QR factor Q of a tall (n, kp) matrix — uses MLX CPU Householder QR.
 
-    A GPU variant via Cholesky-QR on the Gram matrix is possible using
-    ``mlx_addons.linalg.cholesky`` + ``tril_solve``, but Cholesky-QR loses
-    orthogonality as ``cond(Y)^2`` and is unstable for the small / near-
-    rank-deficient matrices that arise in subspace iteration on real data
-    (e.g. molecular PCA features). Double Cholesky-QR (CQR2) restores
-    stability at 2× cost and is a reasonable future addition.
+    We tried Metal Cholesky-QR2 using ``mlx_addons.linalg.cholesky`` +
+    ``tril_solve`` (see :func:`_cholesky_qr` below), but measured it **slower**
+    than CPU QR at the ``kp <= 128`` sizes typical for randomized SVD: each
+    Cholesky + tril_solve pair needs a Metal kernel launch (~0.5 ms), two
+    passes × 2 matmul-QR's per power iteration × ~5 iterations compounds into
+    ~10 extra kernel launches vs a single CPU Householder call. Kept around
+    commented out as a starting point for future work (e.g. once MLX exposes
+    a persistent kernel cache keyed on (dtype, k)).
     """
     with mx.stream(mx.cpu):
         Q, _ = mx.linalg.qr(Y)
