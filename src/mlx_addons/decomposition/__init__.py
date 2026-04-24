@@ -22,6 +22,7 @@ from ._random_projection import (
     SparseRandomProjection,
     johnson_lindenstrauss_min_dim,
 )
+from ._ensemble import EnsembleRandomProjection, ensemble_mean_predict
 
 __all__ = [
     "PCA",
@@ -31,4 +32,6 @@ __all__ = [
     "GaussianRandomProjection",
     "SparseRandomProjection",
     "johnson_lindenstrauss_min_dim",
+    "EnsembleRandomProjection",
+    "ensemble_mean_predict",
 ]
