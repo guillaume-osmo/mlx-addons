@@ -184,17 +184,16 @@ rho = sp2_purify(F, n_occ)               # Niklasson SP2 / TC2 — cold-start, b
 rho = mcweeny_purify(F, rho_warm)        # canonical 3rho^2 - 2rho^3 — warm-start refinement
 ```
 
-`jacobi_eigh` closes the "MLX 0.31.x has no GPU eigh" gap for the small-N regime that semiempirical SCF lives in. Batched cyclic Jacobi rotations, one thread per matrix, both eigenvalues and eigenvectors. Speedup vs MLX's CPU-stream `eigh` on M-series Apple Silicon (B = batch, k = matrix size):
+`jacobi_eigh` closes the "MLX 0.31.x has no GPU eigh" gap for the small-N regime that semiempirical SCF lives in. Two kernel variants are auto-dispatched by batch size: a **thread-local** kernel (1 GPU thread = 1 matrix) for large batches where launch overhead is amortized, and a **threadgroup-cooperative** kernel (1 threadgroup of 64 threads = 1 matrix, parallel row/col updates per rotation) for small batches where per-rotation parallelism wins. Crossover is around `B = JACOBI_TG_BATCH_THRESHOLD` (256) on M-series silicon. Speedup vs MLX's CPU-stream `eigh`, **best of the two kernels**:
 
 | B | k=8 | k=16 | k=24 | k=32 |
 |---:|---:|---:|---:|---:|
-|   100 |   0.89× |   0.37× |   0.20× |   0.14× |
-|   500 | **4.21×** | **1.54×** |   0.96× |   0.62× |
-|  1000 | **3.57×** | **3.06×** | **1.83×** |   0.91× |
-|  2000 | **7.36×** | **6.06×** | **2.82×** | **1.57×** |
-|  5000 | **17.85×** | **11.96×** | **5.57×** | **2.84×** |
+|   100 |   0.44× |   0.81× |   0.83× |   0.80× |
+|   500 | **3.4×** | **1.4×** | **1.5×** | **1.3×** |
+|  1000 | **3.3×** | **2.9×** | **1.7×** | **1.5×** |
+|  2000 | **6.8×** | **5.5×** | **2.7×** | **1.6×** |
 
-Below B≈100 the GPU launch overhead dominates and `mx.linalg.eigh` on the CPU stream is faster. Above ≈500, Jacobi pulls ahead — and the gap widens with B. Sweet spot for batched semiempirical SCF (mlxmolkit's RM1, AM1, and the upcoming xTB GFN0/1/2 with k = 5..50, B = 100s–1000s).
+Below B ≈ 100 the GPU launch overhead dominates and the CPU stream is faster regardless. Above ≈ 500, GPU Jacobi pulls ahead — and the gap widens with B. Sweet spot for batched semiempirical SCF (mlxmolkit's RM1, AM1, and the upcoming xTB GFN0/1/2 with k = 5..32, B = 100s-1000s). Override the dispatch with `kernel="thread"` or `kernel="tg"` if you have a specific size profile in mind.
 
 The crossover where SP2 starts beating dense `eigh` on Apple silicon (the published threshold for GPU SP2 vs LAPACK is N ≈ 1000–2000):
 
