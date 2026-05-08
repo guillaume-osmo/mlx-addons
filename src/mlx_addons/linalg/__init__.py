@@ -20,14 +20,18 @@ Usage::
     s, logd = slogdet(A)  # signed log-determinant
 
 Functions:
-    solve       - Batched A @ x = b for SPD matrices (Cholesky-based, any size)
-    cholesky    - Batched Cholesky factorization (any size)
-    qr          - Batched Householder QR factorization (k <= 128)
-    tril_solve  - Batched forward substitution L @ x = b (k <= 128)
-    triu_solve  - Batched back substitution L^T @ x = b (k <= 128)
-    det         - Batched determinant via LU factorization
-    slogdet     - Batched signed log-determinant via LU
-    logdet_spd  - Batched log-determinant for SPD matrices via GPU Cholesky
+    solve              - Batched A @ x = b for SPD matrices (Cholesky-based, any size)
+    cholesky           - Batched Cholesky factorization (any size)
+    qr                 - Batched Householder QR factorization (k <= 128)
+    tril_solve         - Batched forward substitution L @ x = b (k <= 128)
+    triu_solve         - Batched back substitution L^T @ x = b (k <= 128)
+    det                - Batched determinant via LU factorization
+    slogdet            - Batched signed log-determinant via LU
+    logdet_spd         - Batched log-determinant for SPD matrices via GPU Cholesky
+    gershgorin_bounds  - Cheap (lo, hi) spectral bracket via Gershgorin disks
+    batched_eigh       - Indirection wrapper over mx.linalg.eigh
+    mcweeny_purify     - Canonical McWeeny density-matrix purification
+    sp2_purify         - Niklasson SP2 / TC2 trace-correcting purification
 """
 
 from ._blocked import blocked_cholesky, blocked_solve
@@ -43,6 +47,8 @@ from ._metal_kernels import (
 from ._det import det, slogdet, logdet_spd
 from ._svd import randomized_svd, TruncatedSVD
 from ._sparse import csr_matmul, csr_from_dense
+from ._eig import gershgorin_bounds, batched_eigh
+from ._purification import mcweeny_purify, sp2_purify
 
 # Public API: solve and cholesky handle any matrix size
 solve = blocked_solve
@@ -63,6 +69,10 @@ __all__ = [
     "TruncatedSVD",
     "csr_matmul",
     "csr_from_dense",
+    "gershgorin_bounds",
+    "batched_eigh",
+    "mcweeny_purify",
+    "sp2_purify",
     "MAX_GPU_K",
     "SHARED_K_MAX",
 ]
