@@ -169,15 +169,32 @@ U, S, Vt = randomized_svd(X_batch, n_components=32)   # X_batch: (8, n, m)
 Spectral primitives for SCF and quantum-chemistry workloads.
 
 ```python
-from mlx_addons.linalg import gershgorin_bounds, batched_eigh, sp2_purify, mcweeny_purify
+from mlx_addons.linalg import (
+    gershgorin_bounds, jacobi_eigh, batched_eigh, gen_eigh,
+    sp2_purify, mcweeny_purify,
+)
 
 lo, hi = gershgorin_bounds(F)            # cheap (lo, hi) bracket on the spectrum
-w, v = batched_eigh(F)                   # batched mx.linalg.eigh, defaults to mx.cpu
+w, V = jacobi_eigh(F_batch)              # Metal GPU eigh via cyclic Jacobi (N <= 32)
+w, V = batched_eigh(F)                   # auto-dispatch: GPU Jacobi for small N, CPU else
+w, C = gen_eigh(F, S)                    # generalized: F C = S C diag(w), S SPD
 
 # Build the closed-shell one-electron density (eigh-free), trace = n_occ:
 rho = sp2_purify(F, n_occ)               # Niklasson SP2 / TC2 — cold-start, batched
 rho = mcweeny_purify(F, rho_warm)        # canonical 3rho^2 - 2rho^3 — warm-start refinement
 ```
+
+`jacobi_eigh` closes the "MLX 0.31.x has no GPU eigh" gap for the small-N regime that semiempirical SCF lives in. Batched cyclic Jacobi rotations, one thread per matrix, both eigenvalues and eigenvectors. Speedup vs MLX's CPU-stream `eigh` on M-series Apple Silicon (B = batch, k = matrix size):
+
+| B | k=8 | k=16 | k=24 | k=32 |
+|---:|---:|---:|---:|---:|
+|   100 |   0.89× |   0.37× |   0.20× |   0.14× |
+|   500 | **4.21×** | **1.54×** |   0.96× |   0.62× |
+|  1000 | **3.57×** | **3.06×** | **1.83×** |   0.91× |
+|  2000 | **7.36×** | **6.06×** | **2.82×** | **1.57×** |
+|  5000 | **17.85×** | **11.96×** | **5.57×** | **2.84×** |
+
+Below B≈100 the GPU launch overhead dominates and `mx.linalg.eigh` on the CPU stream is faster. Above ≈500, Jacobi pulls ahead — and the gap widens with B. Sweet spot for batched semiempirical SCF (mlxmolkit's RM1, AM1, and the upcoming xTB GFN0/1/2 with k = 5..50, B = 100s–1000s).
 
 The crossover where SP2 starts beating dense `eigh` on Apple silicon (the published threshold for GPU SP2 vs LAPACK is N ≈ 1000–2000):
 

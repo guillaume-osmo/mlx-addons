@@ -29,7 +29,9 @@ Functions:
     slogdet            - Batched signed log-determinant via LU
     logdet_spd         - Batched log-determinant for SPD matrices via GPU Cholesky
     gershgorin_bounds  - Cheap (lo, hi) spectral bracket via Gershgorin disks
-    batched_eigh       - Indirection wrapper over mx.linalg.eigh
+    jacobi_eigh        - Batched symmetric eigh on Metal GPU (N <= 32)
+    batched_eigh       - Public eigh entry; GPU Jacobi for small N, CPU else
+    gen_eigh           - Generalized symmetric eigenproblem F C = S C diag(w)
     mcweeny_purify     - Canonical McWeeny density-matrix purification
     sp2_purify         - Niklasson SP2 / TC2 trace-correcting purification
 """
@@ -47,7 +49,7 @@ from ._metal_kernels import (
 from ._det import det, slogdet, logdet_spd
 from ._svd import randomized_svd, TruncatedSVD
 from ._sparse import csr_matmul, csr_from_dense
-from ._eig import gershgorin_bounds, batched_eigh
+from ._eig import gershgorin_bounds, batched_eigh, gen_eigh, jacobi_eigh, JACOBI_MAX_N
 from ._purification import mcweeny_purify, sp2_purify
 
 # Public API: solve and cholesky handle any matrix size
@@ -70,7 +72,10 @@ __all__ = [
     "csr_matmul",
     "csr_from_dense",
     "gershgorin_bounds",
+    "jacobi_eigh",
     "batched_eigh",
+    "gen_eigh",
+    "JACOBI_MAX_N",
     "mcweeny_purify",
     "sp2_purify",
     "MAX_GPU_K",
