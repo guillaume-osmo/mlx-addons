@@ -164,6 +164,50 @@ Batched input is supported: pass an array of shape ``(batch, n, m)`` and all mat
 U, S, Vt = randomized_svd(X_batch, n_components=32)   # X_batch: (8, n, m)
 ```
 
+#### Symmetric eigensolver helpers and density-matrix purification
+
+Spectral primitives for SCF and quantum-chemistry workloads.
+
+```python
+from mlx_addons.linalg import gershgorin_bounds, batched_eigh, sp2_purify, mcweeny_purify
+
+lo, hi = gershgorin_bounds(F)            # cheap (lo, hi) bracket on the spectrum
+w, v = batched_eigh(F)                   # batched mx.linalg.eigh, defaults to mx.cpu
+
+# Build the closed-shell one-electron density (eigh-free), trace = n_occ:
+rho = sp2_purify(F, n_occ)               # Niklasson SP2 / TC2 — cold-start, batched
+rho = mcweeny_purify(F, rho_warm)        # canonical 3rho^2 - 2rho^3 — warm-start refinement
+```
+
+The crossover where SP2 starts beating dense `eigh` on Apple silicon (the published threshold for GPU SP2 vs LAPACK is N ≈ 1000–2000):
+
+| N | n_occ | `eigh` (ms) | `sp2_purify` (ms) | speedup |
+|---:|------:|------------:|------------------:|:-------:|
+|   10 |   2 |        0.21 |              7.04 |   0.03× |
+|   50 |  12 |        0.16 |              6.10 |   0.03× |
+|  200 |  50 |        2.12 |             17.23 |   0.12× |
+| 1000 | 250 |       83.69 |             33.73 | **2.48×** |
+
+Below ~500 basis functions, `eigh` wins decisively (per-launch overhead dominates the tiny matmuls). Above ~1000, SP2's matmul-only inner loop pulls ahead. Use SP2 when N is large or when an eigendecomposition is otherwise unavailable; use `eigh` for small Fock matrices.
+
+**Functions:** `gershgorin_bounds`, `batched_eigh`, `sp2_purify`, `mcweeny_purify`.
+
+### `mlx_addons.solvers` — Iterative-solver primitives
+
+```python
+from mlx_addons.solvers import pulay_diis, commutator_error
+
+# Standard SCF DIIS error vector (orthogonal basis):
+e = commutator_error(F, P)               # F @ P - P @ F
+
+# Extrapolate F from a history of (F_i, e_i) pairs:
+F_extrap = pulay_diis(F_history, e_history, max_history=6)
+```
+
+Pulay's DIIS extrapolator solves the augmented `(nd+1) × (nd+1)` Pulay system via `mlx_addons.linalg.solve_lu` (general LU, Metal-accelerated). Batched over leading dims; per-molecule extrapolation in a single call.
+
+**Functions:** `pulay_diis`, `commutator_error`.
+
 ### `mlx_addons.decomposition` — sklearn-style decompositions on GPU
 
 #### Randomized PCA
