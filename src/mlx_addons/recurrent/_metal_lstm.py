@@ -185,16 +185,195 @@ def _lstm_cell_step(input_proj, hidden_proj, cell_prev, precise: bool = False):
     )
 
 
-def metal_lstm_scan(x, Wx, Wh, b, precise: bool = False):
+# ============================================================================
+# VJP kernel — backward pass for the single LSTM cell
+# ============================================================================
+# Math (chain rule through h_new = o * tanh(c_new) and c_new = f * c_prev + i * g):
+#   dc = cot_c + cot_h * o * (1 - tanh(c_new)^2)
+#   do = cot_h * tanh(c_new)
+#   di = dc * g     ;   df = dc * c_prev   ;   dg = dc * i
+#   d_i_gate = di * i * (1 - i)              (sigmoid backward)
+#   d_f_gate = df * f * (1 - f)
+#   d_g_gate = dg * (1 - g^2)                (tanh backward)
+#   d_o_gate = do * o * (1 - o)
+#   d_input_proj = d_hidden_proj = [d_i_gate, d_f_gate, d_g_gate, d_o_gate]
+#   d_cell_prev  = dc * f
+
+def _make_vjp_kernel_source(precise: bool) -> str:
+    sigmoid4 = "stable_sigmoid4_mlxa" if precise else "fast_sigmoid4_mlxa"
+    sigmoid = "stable_sigmoid_mlxa" if precise else "fast_sigmoid_mlxa"
+    tanh = "metal::precise::tanh" if precise else "metal::fast::tanh"
+    return f"""
+    uint hidden_size = cell_prev_shape[1];
+    uint batch_size = cell_prev_shape[0];
+    uint stride_4h = 4u * hidden_size;
+    uint h_quads = (hidden_size + 3u) / 4u;
+    uint total_quads = batch_size * h_quads;
+    uint idx = thread_position_in_grid.x;
+    if (idx >= total_quads) return;
+    uint batch_idx = idx / h_quads;
+    uint h_base = (idx % h_quads) * 4u;
+    uint base = batch_idx * stride_4h + h_base;
+    uint prev_base = batch_idx * hidden_size + h_base;
+
+    if (h_base + 4u <= hidden_size) {{
+        float4 gi4 = *reinterpret_cast<const device float4*>(input_proj + base) +
+                     *reinterpret_cast<const device float4*>(hidden_proj + base);
+        float4 gf4 = *reinterpret_cast<const device float4*>(input_proj + base + hidden_size) +
+                     *reinterpret_cast<const device float4*>(hidden_proj + base + hidden_size);
+        float4 gg4 = *reinterpret_cast<const device float4*>(input_proj + base + 2u * hidden_size) +
+                     *reinterpret_cast<const device float4*>(hidden_proj + base + 2u * hidden_size);
+        float4 go4 = *reinterpret_cast<const device float4*>(input_proj + base + 3u * hidden_size) +
+                     *reinterpret_cast<const device float4*>(hidden_proj + base + 3u * hidden_size);
+
+        float4 i4 = {sigmoid4}(gi4);
+        float4 f4 = {sigmoid4}(gf4);
+        float4 g4 = {tanh}(gg4);
+        float4 o4 = {sigmoid4}(go4);
+
+        float4 c_prev4 = *reinterpret_cast<const device float4*>(cell_prev + prev_base);
+        float4 c_new4 = f4 * c_prev4 + i4 * g4;
+        float4 tanh_c4 = {tanh}(c_new4);
+
+        float4 cot_c4 = *reinterpret_cast<const device float4*>(cot_cell + prev_base);
+        float4 cot_h4 = *reinterpret_cast<const device float4*>(cot_hidden + prev_base);
+
+        float4 dc4 = cot_c4 + cot_h4 * o4 * (1.0f - tanh_c4 * tanh_c4);
+        float4 do4 = cot_h4 * tanh_c4;
+        float4 di4 = dc4 * g4;
+        float4 df4 = dc4 * c_prev4;
+        float4 dg4 = dc4 * i4;
+
+        float4 d_i_gate4 = di4 * i4 * (1.0f - i4);
+        float4 d_f_gate4 = df4 * f4 * (1.0f - f4);
+        float4 d_g_gate4 = dg4 * (1.0f - g4 * g4);
+        float4 d_o_gate4 = do4 * o4 * (1.0f - o4);
+
+        *reinterpret_cast<device float4*>(d_input_proj + base) = d_i_gate4;
+        *reinterpret_cast<device float4*>(d_input_proj + base + hidden_size) = d_f_gate4;
+        *reinterpret_cast<device float4*>(d_input_proj + base + 2u * hidden_size) = d_g_gate4;
+        *reinterpret_cast<device float4*>(d_input_proj + base + 3u * hidden_size) = d_o_gate4;
+
+        *reinterpret_cast<device float4*>(d_hidden_proj + base) = d_i_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base + hidden_size) = d_f_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base + 2u * hidden_size) = d_g_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base + 3u * hidden_size) = d_o_gate4;
+
+        *reinterpret_cast<device float4*>(d_cell_prev + prev_base) = dc4 * f4;
+        return;
+    }}
+
+    for (uint k = 0u; k < 4u && (h_base + k) < hidden_size; k++) {{
+        uint b = base + k;
+        uint pb = prev_base + k;
+        float gi = input_proj[b] + hidden_proj[b];
+        float gf = input_proj[b + hidden_size] + hidden_proj[b + hidden_size];
+        float gg = input_proj[b + 2u * hidden_size] + hidden_proj[b + 2u * hidden_size];
+        float go = input_proj[b + 3u * hidden_size] + hidden_proj[b + 3u * hidden_size];
+        float i_g = {sigmoid}(gi);
+        float f_g = {sigmoid}(gf);
+        float g_g = {tanh}(gg);
+        float o_g = {sigmoid}(go);
+        float c_prev_v = cell_prev[pb];
+        float c_new = f_g * c_prev_v + i_g * g_g;
+        float tanh_c = {tanh}(c_new);
+        float cot_c_v = cot_cell[pb];
+        float cot_h_v = cot_hidden[pb];
+        float dc = cot_c_v + cot_h_v * o_g * (1.0f - tanh_c * tanh_c);
+        float do_v = cot_h_v * tanh_c;
+        float di_v = dc * g_g;
+        float df_v = dc * c_prev_v;
+        float dg_v = dc * i_g;
+        float d_i_gate = di_v * i_g * (1.0f - i_g);
+        float d_f_gate = df_v * f_g * (1.0f - f_g);
+        float d_g_gate = dg_v * (1.0f - g_g * g_g);
+        float d_o_gate = do_v * o_g * (1.0f - o_g);
+        d_input_proj[b] = d_i_gate;
+        d_input_proj[b + hidden_size] = d_f_gate;
+        d_input_proj[b + 2u * hidden_size] = d_g_gate;
+        d_input_proj[b + 3u * hidden_size] = d_o_gate;
+        d_hidden_proj[b] = d_i_gate;
+        d_hidden_proj[b + hidden_size] = d_f_gate;
+        d_hidden_proj[b + 2u * hidden_size] = d_g_gate;
+        d_hidden_proj[b + 3u * hidden_size] = d_o_gate;
+        d_cell_prev[pb] = dc * f_g;
+    }}
+"""
+
+
+_LSTM_CELL_VJP_KERNEL_FAST = mx.fast.metal_kernel(
+    name="mlxa_lstm_cell_vjp_fast",
+    input_names=["input_proj", "hidden_proj", "cell_prev", "cot_cell", "cot_hidden"],
+    output_names=["d_input_proj", "d_hidden_proj", "d_cell_prev"],
+    source=_make_vjp_kernel_source(precise=False),
+    header=_HEADER,
+    ensure_row_contiguous=True,
+)
+
+_LSTM_CELL_VJP_KERNEL_PRECISE = mx.fast.metal_kernel(
+    name="mlxa_lstm_cell_vjp_precise",
+    input_names=["input_proj", "hidden_proj", "cell_prev", "cot_cell", "cot_hidden"],
+    output_names=["d_input_proj", "d_hidden_proj", "d_cell_prev"],
+    source=_make_vjp_kernel_source(precise=True),
+    header=_HEADER,
+    ensure_row_contiguous=True,
+)
+
+
+def _lstm_cell_vjp_step(input_proj, hidden_proj, cell_prev, cot_cell, cot_hidden,
+                        precise: bool = False):
+    B, fourH = input_proj.shape
+    H = fourH // 4
+    h_quads = (H + 3) // 4
+    total = B * h_quads
+    tg = _pick_threads_per_group(H, B, total)
+    kernel = _LSTM_CELL_VJP_KERNEL_PRECISE if precise else _LSTM_CELL_VJP_KERNEL_FAST
+    return kernel(
+        inputs=[input_proj, hidden_proj, cell_prev, cot_cell, cot_hidden],
+        output_shapes=[(B, 4 * H), (B, 4 * H), (B, H)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+        grid=(total, 1, 1),
+        threadgroup=(tg, 1, 1),
+    )
+
+
+# ============================================================================
+# Differentiable cell — forward + VJP wired through mx.custom_function
+# ============================================================================
+
+@mx.custom_function
+def metal_lstm_cell(input_proj, hidden_proj, cell_prev):
+    """LSTM cell with autograd-aware Metal kernels (forward + VJP).
+
+    Use this inside a Python time loop instead of _lstm_cell_step when you need
+    `mx.grad(...)` to flow through. For inference-only paths use _lstm_cell_step
+    directly (one fewer Python wrapper)."""
+    return _lstm_cell_step(input_proj, hidden_proj, cell_prev, precise=False)
+
+
+@metal_lstm_cell.vjp
+def _metal_lstm_cell_vjp(primals, cotangents, outputs):
+    input_proj, hidden_proj, cell_prev = primals
+    cot_cell, cot_hidden = cotangents
+    return _lstm_cell_vjp_step(input_proj, hidden_proj, cell_prev, cot_cell, cot_hidden,
+                               precise=False)
+
+
+def metal_lstm_scan(x, Wx, Wh, b, precise: bool = False, differentiable: bool = False):
     """Full LSTM forward using fused cell kernel.
     x: (B, T, D), Wx: (4H, D), Wh: (4H, H), b: (4H,)
     Returns hidden states (B, T, H).
-    precise=True uses metal::precise::{tanh, exp} (~1e-7 vs mlx.nn.LSTM,
-    slightly slower); fast=False uses fast::tanh and fast_sigmoid (~3e-5 diff,
-    fastest).
+
+    precise=True uses metal::precise::{tanh, exp} (~1e-7 vs mlx.nn.LSTM).
+    differentiable=True routes through mx.custom_function so mx.grad flows
+        through (uses the VJP kernel). Required for training. Slightly slower
+        per call due to the custom_function wrapper but functionally identical.
     """
     if precise is False and _env_use_precise():
         precise = True
+    cell = metal_lstm_cell if differentiable else (
+        lambda i_p, h_p, c_p: _lstm_cell_step(i_p, h_p, c_p, precise=precise)
+    )
     B, T, _ = x.shape
     H = Wh.shape[-1]
     e_proj = x @ Wx.T + b
@@ -203,20 +382,26 @@ def metal_lstm_scan(x, Wx, Wh, b, precise: bool = False):
     outs = []
     for t in range(T):
         h_proj = h @ Wh.T
-        c, h = _lstm_cell_step(e_proj[:, t, :], h_proj, c, precise=precise)
+        c, h = cell(e_proj[:, t, :], h_proj, c)
         outs.append(h)
     return mx.stack(outs, axis=1)
 
 
 class MetalLSTM(mlxnn.Module):
-    """Drop-in replacement for mlx.nn.LSTM. Same Wx/Wh/bias weight layout."""
+    """Drop-in replacement for mlx.nn.LSTM. Same Wx/Wh/bias weight layout.
+
+    Set `differentiable=True` (default for training mode) to route through
+    the VJP-wired Metal kernel so `mx.grad(model)` works. Inference-only
+    paths can set it False for a marginally lower-overhead call.
+    """
 
     def __init__(self, input_size: int, hidden_size: int, bias: bool = True,
-                 precise: bool = False):
+                 precise: bool = False, differentiable: bool = True):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.precise = precise
+        self.differentiable = differentiable
         scale = (1.0 / hidden_size) ** 0.5
         self.Wx = mx.random.uniform(-scale, scale, (4 * hidden_size, input_size))
         self.Wh = mx.random.uniform(-scale, scale, (4 * hidden_size, hidden_size))
@@ -224,7 +409,9 @@ class MetalLSTM(mlxnn.Module):
 
     def __call__(self, x):
         bias = self.bias if self.bias is not None else mx.zeros((4 * self.hidden_size,))
-        h = metal_lstm_scan(x, self.Wx, self.Wh, bias, precise=self.precise)
+        h = metal_lstm_scan(x, self.Wx, self.Wh, bias,
+                            precise=self.precise,
+                            differentiable=self.differentiable)
         return h, None
 
 
