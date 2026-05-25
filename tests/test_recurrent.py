@@ -170,3 +170,48 @@ class TestGroupedForward:
         mx.eval(out)
         assert not np.isnan(out).any()
         assert not np.isinf(out).any()
+
+
+class TestGroupedVJP:
+    """metal_grouped_lstm_scan(differentiable=True) gradients must match
+    autograd through a pure-MLX reference."""
+
+    def test_grouped_scan_gradients_match(self):
+        H, D, B, T, G = 64, 27, 4, 10, 4
+        rng = np.random.RandomState(0)
+        x = mx.array(rng.randn(B, T, D).astype(np.float32))
+        Wx = mx.array(rng.randn(G, 4 * H, D).astype(np.float32) * 0.1)
+        Wh = mx.array(rng.randn(G, 4 * H, H).astype(np.float32) * 0.1)
+        b = mx.array(rng.randn(G, 4 * H).astype(np.float32) * 0.01)
+
+        def ref_grouped(x, Wx_s, Wh_s, b_s):
+            B_, T_, D_ = x.shape
+            G_, _, H_ = Wh_s.shape
+            Wx_flat = Wx_s.reshape(-1, D_)
+            e_proj = (x @ Wx_flat.T).reshape(B_, T_, G_, 4 * H_) + b_s
+            h = mx.zeros((B_, G_, H_)); c = mx.zeros((B_, G_, H_))
+            outs = []
+            for t in range(T_):
+                h_proj = mx.einsum("bgh,gih->bgi", h, Wh_s)
+                gates = e_proj[:, t, :, :] + h_proj
+                i = mx.sigmoid(gates[..., :H_])
+                f = mx.sigmoid(gates[..., H_:2 * H_])
+                g_ = mx.tanh(gates[..., 2 * H_:3 * H_])
+                o = mx.sigmoid(gates[..., 3 * H_:4 * H_])
+                c = f * c + i * g_
+                h = o * mx.tanh(c)
+                outs.append(h)
+            return mx.stack(outs, axis=1)
+
+        def loss_ref(x, Wx, Wh, b):
+            return mx.sum(ref_grouped(x, Wx, Wh, b) ** 2)
+
+        def loss_metal(x, Wx, Wh, b):
+            return mx.sum(metal_grouped_lstm_scan(x, Wx, Wh, b, differentiable=True) ** 2)
+
+        g_ref = mx.grad(loss_ref, argnums=(0, 1, 2, 3))(x, Wx, Wh, b)
+        g_metal = mx.grad(loss_metal, argnums=(0, 1, 2, 3))(x, Wx, Wh, b)
+        for name, gr, gm in zip(("dx", "dWx", "dWh", "db"), g_ref, g_metal):
+            diff = float(mx.max(mx.abs(gr - gm)))
+            norm = float(mx.max(mx.abs(gr))) + 1e-9
+            assert diff / norm < 1e-4, f"{name} rel_err {diff/norm:.3e}"
