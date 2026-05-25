@@ -647,6 +647,123 @@ class MetalLSTM(mlxnn.Module):
 
 
 # ============================================================================
+# Full-scan kernel — one launch for the entire T-step LSTM scan
+# ============================================================================
+# Eliminates ~84 sequential kernel launches (per-timestep cell + h @ Wh matmul)
+# by running everything in a single Metal launch. Threadgroup-cooperative:
+# - One threadgroup per batch element, 4H threads each
+# - Each thread owns ONE gate-column for all timesteps
+# - h_shared and gate_shared in threadgroup memory carry state across timesteps
+#
+# Restriction: currently hardcoded H <= 64 (threadgroup-shared array sizes).
+# Falls back to the per-cell scan if H > 64.
+#
+# Speed (vs metal cell-scan, Apple M4 Pro, T=42, H=64):
+#   batch=1     0.94ms → 0.47ms  (2.0× faster)
+#   batch=16    1.24ms → 0.55ms  (2.3× faster)
+#   batch=64    1.14ms → 0.70ms  (1.6× faster)
+#   batch=256   1.12ms → 1.42ms  (0.79× — slower, naive matmul becomes the bottleneck)
+#   batch=512   1.48ms → 2.72ms  (0.54× — much slower)
+#
+# At larger batches the naive per-thread recurrent matmul is bandwidth-bound;
+# simdgroup_matrix tiling would fix this but is a separate engineering effort.
+# For now, use auto-select in MetalLSTMFast (full-scan for small batches).
+
+_FULL_SCAN_SOURCE = """
+    uint batch_idx = threadgroup_position_in_grid.x;
+    uint tid = thread_position_in_threadgroup.x;
+    uint B = e_proj_shape[0];
+    uint T = e_proj_shape[1];
+    uint H = Wh_shape[1];
+    uint fourH = 4u * H;
+
+    if (batch_idx >= B) return;
+    if (tid >= fourH) return;
+
+    uint gate_id = tid / H;
+    uint h_idx = tid % H;
+
+    threadgroup float h_shared[64];
+    threadgroup float gate_shared[256];
+
+    float c_self = 0.0f;
+
+    if (tid < H) {
+        h_shared[tid] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint t = 0; t < T; t++) {
+        float acc = 0.0f;
+        device const float* wh_row = Wh + tid * H;
+        for (uint k = 0; k < H; k++) {
+            acc += h_shared[k] * wh_row[k];
+        }
+        acc += e_proj[batch_idx * T * fourH + t * fourH + tid];
+
+        float gate = (gate_id == 2u) ? metal::fast::tanh(acc) : fast_sigmoid_mlxa(acc);
+        gate_shared[tid] = gate;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid < H) {
+            float i_g = gate_shared[h_idx];
+            float f_g = gate_shared[H + h_idx];
+            float g_g = gate_shared[2u * H + h_idx];
+            float o_g = gate_shared[3u * H + h_idx];
+            float c_new = f_g * c_self + i_g * g_g;
+            float h_new = o_g * metal::fast::tanh(c_new);
+            c_self = c_new;
+            h_shared[h_idx] = h_new;
+            h_out[batch_idx * T * H + t * H + h_idx] = h_new;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+"""
+
+_FULL_SCAN_KERNEL = mx.fast.metal_kernel(
+    name="mlxa_lstm_full_scan",
+    input_names=["e_proj", "Wh"],
+    output_names=["h_out"],
+    source=_FULL_SCAN_SOURCE,
+    header=_HEADER,
+    ensure_row_contiguous=True,
+)
+
+
+def metal_lstm_full_scan(x, Wx, Wh, b):
+    """One-launch full LSTM scan. Hidden-size limited to 64 by hardcoded
+    threadgroup arrays — falls back to cell-scan otherwise."""
+    B, T, _ = x.shape
+    H = Wh.shape[-1]
+    if H > 64:
+        return metal_lstm_scan(x, Wx, Wh, b)
+    fourH = 4 * H
+    e_proj = x @ Wx.T + b
+    return _FULL_SCAN_KERNEL(
+        inputs=[e_proj, Wh],
+        output_shapes=[(B, T, H)],
+        output_dtypes=[mx.float32],
+        grid=(B * fourH, 1, 1),
+        threadgroup=(fourH, 1, 1),
+    )[0]
+
+
+def metal_lstm_scan_auto(x, Wx, Wh, b, batch_cutoff: int = 128):
+    """Auto-select: full-scan for B < cutoff (kernel-launch bound), per-cell
+    scan for B >= cutoff (compute bound, where the per-cell + MLX matmul is
+    better than the naive matmul inside our full-scan kernel).
+
+    Inference path only (no VJP). For training, use MetalLSTM(differentiable=True)
+    which routes through metal_lstm_scan with the VJP cell kernel.
+    """
+    B = x.shape[0]
+    H = Wh.shape[-1]
+    if H <= 64 and B < batch_cutoff:
+        return metal_lstm_full_scan(x, Wx, Wh, b)
+    return metal_lstm_scan(x, Wx, Wh, b)
+
+
+# ============================================================================
 # Grouped LSTM cell kernel — G branches in one launch
 # ============================================================================
 

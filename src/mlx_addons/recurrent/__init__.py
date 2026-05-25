@@ -16,12 +16,16 @@ from ._metal_lstm import (
     GroupedMetalLSTM,
     MetalLSTM,
     metal_grouped_lstm_scan,
+    metal_lstm_full_scan,
     metal_lstm_scan,
+    metal_lstm_scan_auto,
 )
 
 __all__ = [
     "MetalLSTM",
     "GroupedMetalLSTM",
     "metal_lstm_scan",
+    "metal_lstm_full_scan",
+    "metal_lstm_scan_auto",
     "metal_grouped_lstm_scan",
 ]

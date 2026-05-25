@@ -11,7 +11,9 @@ from mlx_addons.recurrent import (
     GroupedMetalLSTM,
     MetalLSTM,
     metal_grouped_lstm_scan,
+    metal_lstm_full_scan,
     metal_lstm_scan,
+    metal_lstm_scan_auto,
 )
 from mlx_addons.recurrent._metal_lstm import metal_lstm_cell
 
@@ -170,6 +172,36 @@ class TestGroupedForward:
         mx.eval(out)
         assert not np.isnan(out).any()
         assert not np.isinf(out).any()
+
+
+class TestFullScan:
+    """metal_lstm_full_scan runs the entire T-step LSTM in one kernel launch."""
+
+    def test_full_scan_matches_mlx_nn_lstm(self):
+        H, D, B, T = 64, 27, 8, 42
+        ref = mlxnn.LSTM(D, H)
+        rng = np.random.RandomState(0)
+        x = mx.array(rng.randn(B, T, D).astype(np.float32))
+        h_ref, _ = ref(x); mx.eval(h_ref)
+        h_full = metal_lstm_full_scan(x, ref.Wx, ref.Wh, ref.bias)
+        mx.eval(h_full)
+        diff = float(mx.max(mx.abs(h_ref - h_full)))
+        assert diff < 1e-5, f"full_scan max_diff {diff}"
+
+    def test_auto_wrapper_matches(self):
+        """The auto-select wrapper should produce the same result regardless
+        of which underlying path it picks."""
+        H, D, T = 64, 27, 42
+        ref = mlxnn.LSTM(D, H)
+        rng = np.random.RandomState(0)
+        # batch=32 → full_scan path; batch=256 → cell-scan path (auto cutoff 128)
+        for B in (32, 256):
+            x = mx.array(rng.randn(B, T, D).astype(np.float32))
+            h_ref, _ = ref(x); mx.eval(h_ref)
+            h_auto = metal_lstm_scan_auto(x, ref.Wx, ref.Wh, ref.bias)
+            mx.eval(h_auto)
+            diff = float(mx.max(mx.abs(h_ref - h_auto)))
+            assert diff < 1e-5, f"auto batch={B} max_diff {diff}"
 
 
 class TestGroupedVJP:
