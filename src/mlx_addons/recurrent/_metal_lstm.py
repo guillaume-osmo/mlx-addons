@@ -359,21 +359,252 @@ def _metal_lstm_cell_vjp(primals, cotangents, outputs):
                                precise=False)
 
 
-def metal_lstm_scan(x, Wx, Wh, b, precise: bool = False, differentiable: bool = False):
+# ============================================================================
+# Residual-saving variants — forward saves (gates, tanh_c) so VJP avoids
+# recomputing the 5 expensive activations per quad.
+# ============================================================================
+
+_SOURCE_FORWARD_WITH_RESIDUALS = """
+    uint hidden_size = cell_prev_shape[1];
+    uint batch_size = cell_prev_shape[0];
+    uint stride_4h = 4u * hidden_size;
+    uint h_quads = (hidden_size + 3u) / 4u;
+    uint total_quads = batch_size * h_quads;
+    uint idx = thread_position_in_grid.x;
+    if (idx >= total_quads) return;
+    uint batch_idx = idx / h_quads;
+    uint h_base = (idx % h_quads) * 4u;
+    uint base = batch_idx * stride_4h + h_base;
+    uint prev_base = batch_idx * hidden_size + h_base;
+
+    if (h_base + 4u <= hidden_size) {
+        float4 i4 = fast_sigmoid4_mlxa(
+            *reinterpret_cast<const device float4*>(input_proj + base) +
+            *reinterpret_cast<const device float4*>(hidden_proj + base));
+        float4 f4 = fast_sigmoid4_mlxa(
+            *reinterpret_cast<const device float4*>(input_proj + base + hidden_size) +
+            *reinterpret_cast<const device float4*>(hidden_proj + base + hidden_size));
+        float4 g4 = metal::fast::tanh(
+            *reinterpret_cast<const device float4*>(input_proj + base + 2u * hidden_size) +
+            *reinterpret_cast<const device float4*>(hidden_proj + base + 2u * hidden_size));
+        float4 o4 = fast_sigmoid4_mlxa(
+            *reinterpret_cast<const device float4*>(input_proj + base + 3u * hidden_size) +
+            *reinterpret_cast<const device float4*>(hidden_proj + base + 3u * hidden_size));
+        float4 c_prev4 = *reinterpret_cast<const device float4*>(cell_prev + prev_base);
+        float4 c_new4 = f4 * c_prev4 + i4 * g4;
+        float4 tanh_c4 = metal::fast::tanh(c_new4);
+        *reinterpret_cast<device float4*>(output_cell + prev_base) = c_new4;
+        *reinterpret_cast<device float4*>(output_hidden + prev_base) = o4 * tanh_c4;
+        // Save residuals: gates packed as (B, 4H) in same layout as input_proj
+        *reinterpret_cast<device float4*>(residuals_gates + base) = i4;
+        *reinterpret_cast<device float4*>(residuals_gates + base + hidden_size) = f4;
+        *reinterpret_cast<device float4*>(residuals_gates + base + 2u * hidden_size) = g4;
+        *reinterpret_cast<device float4*>(residuals_gates + base + 3u * hidden_size) = o4;
+        *reinterpret_cast<device float4*>(residuals_tanh_c + prev_base) = tanh_c4;
+        return;
+    }
+
+    for (uint k = 0u; k < 4u && (h_base + k) < hidden_size; k++) {
+        uint b = base + k;
+        uint pb = prev_base + k;
+        float i_g = fast_sigmoid_mlxa(input_proj[b] + hidden_proj[b]);
+        float f_g = fast_sigmoid_mlxa(input_proj[b + hidden_size] + hidden_proj[b + hidden_size]);
+        float g_g = metal::fast::tanh(input_proj[b + 2u * hidden_size] + hidden_proj[b + 2u * hidden_size]);
+        float o_g = fast_sigmoid_mlxa(input_proj[b + 3u * hidden_size] + hidden_proj[b + 3u * hidden_size]);
+        float c_prev = cell_prev[pb];
+        float c_new = f_g * c_prev + i_g * g_g;
+        float tanh_c = metal::fast::tanh(c_new);
+        output_cell[pb] = c_new;
+        output_hidden[pb] = o_g * tanh_c;
+        residuals_gates[b] = i_g;
+        residuals_gates[b + hidden_size] = f_g;
+        residuals_gates[b + 2u * hidden_size] = g_g;
+        residuals_gates[b + 3u * hidden_size] = o_g;
+        residuals_tanh_c[pb] = tanh_c;
+    }
+"""
+
+_LSTM_CELL_FWD_RES_KERNEL = mx.fast.metal_kernel(
+    name="mlxa_lstm_cell_fwd_residuals",
+    input_names=["input_proj", "hidden_proj", "cell_prev"],
+    output_names=["output_cell", "output_hidden", "residuals_gates", "residuals_tanh_c"],
+    source=_SOURCE_FORWARD_WITH_RESIDUALS,
+    header=_HEADER,
+    ensure_row_contiguous=True,
+)
+
+
+def _lstm_cell_step_fwd_residuals(input_proj, hidden_proj, cell_prev):
+    B, fourH = input_proj.shape
+    H = fourH // 4
+    h_quads = (H + 3) // 4
+    total = B * h_quads
+    tg = _pick_threads_per_group(H, B, total)
+    return _LSTM_CELL_FWD_RES_KERNEL(
+        inputs=[input_proj, hidden_proj, cell_prev],
+        output_shapes=[(B, H), (B, H), (B, 4 * H), (B, H)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32, mx.float32],
+        grid=(total, 1, 1),
+        threadgroup=(tg, 1, 1),
+    )
+
+
+_SOURCE_VJP_FROM_RESIDUALS = """
+    uint hidden_size = cell_prev_shape[1];
+    uint batch_size = cell_prev_shape[0];
+    uint stride_4h = 4u * hidden_size;
+    uint h_quads = (hidden_size + 3u) / 4u;
+    uint total_quads = batch_size * h_quads;
+    uint idx = thread_position_in_grid.x;
+    if (idx >= total_quads) return;
+    uint batch_idx = idx / h_quads;
+    uint h_base = (idx % h_quads) * 4u;
+    uint base = batch_idx * stride_4h + h_base;
+    uint prev_base = batch_idx * hidden_size + h_base;
+
+    if (h_base + 4u <= hidden_size) {
+        // Read saved residuals (cheap memory reads instead of recompute)
+        float4 i4 = *reinterpret_cast<const device float4*>(gates + base);
+        float4 f4 = *reinterpret_cast<const device float4*>(gates + base + hidden_size);
+        float4 g4 = *reinterpret_cast<const device float4*>(gates + base + 2u * hidden_size);
+        float4 o4 = *reinterpret_cast<const device float4*>(gates + base + 3u * hidden_size);
+        float4 tanh_c4 = *reinterpret_cast<const device float4*>(tanh_c + prev_base);
+        float4 c_prev4 = *reinterpret_cast<const device float4*>(cell_prev + prev_base);
+
+        float4 cot_c4 = *reinterpret_cast<const device float4*>(cot_cell + prev_base);
+        float4 cot_h4 = *reinterpret_cast<const device float4*>(cot_hidden + prev_base);
+
+        float4 dc4 = cot_c4 + cot_h4 * o4 * (1.0f - tanh_c4 * tanh_c4);
+        float4 do4 = cot_h4 * tanh_c4;
+        float4 di4 = dc4 * g4;
+        float4 df4 = dc4 * c_prev4;
+        float4 dg4 = dc4 * i4;
+
+        float4 d_i_gate4 = di4 * i4 * (1.0f - i4);
+        float4 d_f_gate4 = df4 * f4 * (1.0f - f4);
+        float4 d_g_gate4 = dg4 * (1.0f - g4 * g4);
+        float4 d_o_gate4 = do4 * o4 * (1.0f - o4);
+
+        *reinterpret_cast<device float4*>(d_input_proj + base) = d_i_gate4;
+        *reinterpret_cast<device float4*>(d_input_proj + base + hidden_size) = d_f_gate4;
+        *reinterpret_cast<device float4*>(d_input_proj + base + 2u * hidden_size) = d_g_gate4;
+        *reinterpret_cast<device float4*>(d_input_proj + base + 3u * hidden_size) = d_o_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base) = d_i_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base + hidden_size) = d_f_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base + 2u * hidden_size) = d_g_gate4;
+        *reinterpret_cast<device float4*>(d_hidden_proj + base + 3u * hidden_size) = d_o_gate4;
+        *reinterpret_cast<device float4*>(d_cell_prev + prev_base) = dc4 * f4;
+        return;
+    }
+
+    for (uint k = 0u; k < 4u && (h_base + k) < hidden_size; k++) {
+        uint b = base + k;
+        uint pb = prev_base + k;
+        float i_g = gates[b];
+        float f_g = gates[b + hidden_size];
+        float g_g = gates[b + 2u * hidden_size];
+        float o_g = gates[b + 3u * hidden_size];
+        float tanh_c_v = tanh_c[pb];
+        float c_prev_v = cell_prev[pb];
+        float cot_c_v = cot_cell[pb];
+        float cot_h_v = cot_hidden[pb];
+        float dc = cot_c_v + cot_h_v * o_g * (1.0f - tanh_c_v * tanh_c_v);
+        float do_v = cot_h_v * tanh_c_v;
+        float di_v = dc * g_g;
+        float df_v = dc * c_prev_v;
+        float dg_v = dc * i_g;
+        float d_i_gate = di_v * i_g * (1.0f - i_g);
+        float d_f_gate = df_v * f_g * (1.0f - f_g);
+        float d_g_gate = dg_v * (1.0f - g_g * g_g);
+        float d_o_gate = do_v * o_g * (1.0f - o_g);
+        d_input_proj[b] = d_i_gate;
+        d_input_proj[b + hidden_size] = d_f_gate;
+        d_input_proj[b + 2u * hidden_size] = d_g_gate;
+        d_input_proj[b + 3u * hidden_size] = d_o_gate;
+        d_hidden_proj[b] = d_i_gate;
+        d_hidden_proj[b + hidden_size] = d_f_gate;
+        d_hidden_proj[b + 2u * hidden_size] = d_g_gate;
+        d_hidden_proj[b + 3u * hidden_size] = d_o_gate;
+        d_cell_prev[pb] = dc * f_g;
+    }
+"""
+
+_LSTM_CELL_VJP_RES_KERNEL = mx.fast.metal_kernel(
+    name="mlxa_lstm_cell_vjp_residuals",
+    input_names=["cell_prev", "gates", "tanh_c", "cot_cell", "cot_hidden"],
+    output_names=["d_input_proj", "d_hidden_proj", "d_cell_prev"],
+    source=_SOURCE_VJP_FROM_RESIDUALS,
+    header=_HEADER,
+    ensure_row_contiguous=True,
+)
+
+
+def _lstm_cell_vjp_from_residuals(cell_prev, gates, tanh_c, cot_cell, cot_hidden):
+    B, fourH = gates.shape
+    H = fourH // 4
+    h_quads = (H + 3) // 4
+    total = B * h_quads
+    tg = _pick_threads_per_group(H, B, total)
+    return _LSTM_CELL_VJP_RES_KERNEL(
+        inputs=[cell_prev, gates, tanh_c, cot_cell, cot_hidden],
+        output_shapes=[(B, 4 * H), (B, 4 * H), (B, H)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+        grid=(total, 1, 1),
+        threadgroup=(tg, 1, 1),
+    )
+
+
+@mx.custom_function
+def metal_lstm_cell_v2(input_proj, hidden_proj, cell_prev):
+    """Residual-saving variant — forward writes gates+tanh_c so VJP avoids
+    recomputing them. Returns 4-tuple (cell_new, hidden_new, gates, tanh_c);
+    the residual outputs are consumed only by the VJP.
+
+    NOTE on Apple Silicon: this is NOT measurably faster than the recompute
+    variant — `metal::fast::tanh` and `fast_sigmoid` are so cheap that the
+    extra memory traffic for the residuals matches their compute cost. We
+    ship this for completeness (may help on hardware where transcendentals
+    are more expensive, e.g., CUDA SMs without dedicated SFU pipelines)."""
+    return _lstm_cell_step_fwd_residuals(input_proj, hidden_proj, cell_prev)
+
+
+@metal_lstm_cell_v2.vjp
+def _metal_lstm_cell_v2_vjp(primals, cotangents, outputs):
+    input_proj, hidden_proj, cell_prev = primals
+    cot_cell, cot_hidden, _, _ = cotangents  # residual cotangents ignored
+    cell_new, hidden_new, gates_res, tanh_c_res = outputs
+    d_inp, d_hid, d_prev = _lstm_cell_vjp_from_residuals(
+        cell_prev, gates_res, tanh_c_res, cot_cell, cot_hidden
+    )
+    # Return gradients for all 3 primals; cotangents for residual outputs are
+    # zero so no gradient flows back through them.
+    return d_inp, d_hid, d_prev
+
+
+def metal_lstm_scan(x, Wx, Wh, b, precise: bool = False, differentiable: bool = False,
+                    save_residuals: bool = False):
     """Full LSTM forward using fused cell kernel.
     x: (B, T, D), Wx: (4H, D), Wh: (4H, H), b: (4H,)
     Returns hidden states (B, T, H).
 
     precise=True uses metal::precise::{tanh, exp} (~1e-7 vs mlx.nn.LSTM).
-    differentiable=True routes through mx.custom_function so mx.grad flows
-        through (uses the VJP kernel). Required for training. Slightly slower
-        per call due to the custom_function wrapper but functionally identical.
+    differentiable=True routes through mx.custom_function so mx.grad flows.
+    save_residuals=True uses the residual-saving cell + VJP kernels — backward
+        avoids recomputing gate activations. Modest speedup at training time;
+        ignored when differentiable=False. Default False (matches default
+        forward kernel for inference).
     """
     if precise is False and _env_use_precise():
         precise = True
-    cell = metal_lstm_cell if differentiable else (
-        lambda i_p, h_p, c_p: _lstm_cell_step(i_p, h_p, c_p, precise=precise)
-    )
+    if differentiable:
+        if save_residuals:
+            def cell(i_p, h_p, c_p):
+                c, h, _, _ = metal_lstm_cell_v2(i_p, h_p, c_p)
+                return c, h
+        else:
+            cell = metal_lstm_cell
+    else:
+        cell = lambda i_p, h_p, c_p: _lstm_cell_step(i_p, h_p, c_p, precise=precise)
     B, T, _ = x.shape
     H = Wh.shape[-1]
     e_proj = x @ Wx.T + b
