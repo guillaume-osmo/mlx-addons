@@ -20,7 +20,7 @@ import mlx.core as mx
 import numpy as np
 
 
-KernelName = Literal["linear", "rbf", "poly", "polynomial", "sigmoid"]
+KernelName = Literal["linear", "rbf", "poly", "polynomial", "sigmoid", "precomputed"]
 
 
 def _sq_dists_mx(X: mx.array, Y: Optional[mx.array] = None) -> mx.array:

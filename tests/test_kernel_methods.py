@@ -144,3 +144,42 @@ class TestKernelPCA:
         # sklearn stores eigenvalues in descending order
         rel = np.abs(ours.eigenvalues_ - theirs.eigenvalues_) / np.maximum(theirs.eigenvalues_, 1e-8)
         assert rel.max() < 1e-3, f"max rel err on eigenvalues = {rel.max():.3e}"
+
+    def test_precomputed_matches_rbf_path(self):
+        """Feeding the precomputed RBF Gram reproduces the built-in rbf KernelPCA embedding."""
+        rng = np.random.default_rng(7)
+        X = rng.standard_normal((120, 6)).astype(np.float32)
+
+        Z_rbf = KernelPCA(n_components=5, kernel="rbf", gamma=0.2).fit_transform(X)
+        K = pairwise_kernel(X, kernel="rbf", gamma=0.2)              # precompute the same Gram
+        Z_pre = KernelPCA(n_components=5, kernel="precomputed").fit_transform(K)
+
+        # embedding is identical up to per-component sign → compare pairwise distances
+        def pdist(Z):
+            s = (Z[:, None, :] - Z[None, :, :]) ** 2
+            return np.sqrt(s.sum(axis=-1))
+        relerr = np.linalg.norm(pdist(Z_pre) - pdist(Z_rbf)) / np.linalg.norm(pdist(Z_rbf))
+        assert relerr < 1e-4, f"pdist relerr = {relerr:.3e}"
+
+    def test_precomputed_sklearn_parity_and_oos(self):
+        """Precomputed KernelPCA matches sklearn on eigenvalues and out-of-sample transform."""
+        sk = pytest.importorskip("sklearn.decomposition")
+        rng = np.random.default_rng(8)
+        Xtr = rng.standard_normal((130, 5)).astype(np.float32)
+        Xte = rng.standard_normal((40, 5)).astype(np.float32)
+        Ktr = pairwise_kernel(Xtr, kernel="rbf", gamma=0.15)
+        Kte = pairwise_kernel(Xte, Xtr, kernel="rbf", gamma=0.15)   # (n_new, n_fit)
+
+        ours = KernelPCA(n_components=8, kernel="precomputed").fit(Ktr)
+        theirs = sk.KernelPCA(n_components=8, kernel="precomputed").fit(Ktr)
+        rel = np.abs(ours.eigenvalues_ - theirs.eigenvalues_) / np.maximum(theirs.eigenvalues_, 1e-8)
+        assert rel.max() < 1e-3, f"eigenvalue rel err = {rel.max():.3e}"
+
+        # out-of-sample projection agrees up to per-component sign
+        Zo, Zt = ours.transform(Kte), theirs.transform(Kte)
+        signs = np.sign((Zo * Zt).sum(0)); signs[signs == 0] = 1
+        np.testing.assert_allclose(Zo * signs, Zt, atol=1e-3, rtol=1e-3)
+
+    def test_precomputed_requires_square(self):
+        with pytest.raises(ValueError):
+            KernelPCA(n_components=2, kernel="precomputed").fit(np.zeros((10, 7), np.float32))

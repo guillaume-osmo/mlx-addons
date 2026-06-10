@@ -35,8 +35,12 @@ class KernelPCA:
     Parameters
     ----------
     n_components : int
-    kernel : one of "linear", "rbf", "poly"/"polynomial", "sigmoid". Default "rbf".
-    gamma, degree, coef0 : kernel parameters.
+    kernel : one of "linear", "rbf", "poly"/"polynomial", "sigmoid", "precomputed".
+        Default "rbf". With "precomputed", ``fit`` expects the square ``(n, n)``
+        Gram matrix instead of features, and ``transform`` expects the
+        ``(n_new, n_fit)`` kernel between new points and the fit points. This lets
+        you use any custom kernel (Wasserstein, Tanimoto, graph kernels, ...).
+    gamma, degree, coef0 : kernel parameters (ignored for "precomputed").
     remove_zero_eig : bool, default=True
         Drop components whose eigenvalue is effectively zero.
 
@@ -75,12 +79,22 @@ class KernelPCA:
 
     def fit(self, X: np.ndarray, y=None) -> "KernelPCA":
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-        self.X_fit_ = X
 
-        K = pairwise_kernel(
-            X, kernel=self.kernel, gamma=self.gamma,
-            degree=self.degree, coef0=self.coef0,
-        )
+        if self.kernel == "precomputed":
+            if X.ndim != 2 or X.shape[0] != X.shape[1]:
+                raise ValueError(
+                    f"precomputed kernel must be a square (n, n) Gram matrix, got {X.shape}"
+                )
+            self.X_fit_ = None
+            self._n_fit = X.shape[0]
+            K = X
+        else:
+            self.X_fit_ = X
+            self._n_fit = X.shape[0]
+            K = pairwise_kernel(
+                X, kernel=self.kernel, gamma=self.gamma,
+                degree=self.degree, coef0=self.coef0,
+            )
         Kc, self._row_means, self._total_mean = self._center_K(K)
 
         # Symmetrize to guard tiny float asymmetry from the centering.
@@ -108,11 +122,18 @@ class KernelPCA:
 
     def transform(self, X: np.ndarray) -> np.ndarray:
         X = np.ascontiguousarray(np.asarray(X, dtype=np.float32))
-        K_new = pairwise_kernel(
-            X, self.X_fit_,
-            kernel=self.kernel, gamma=self.gamma,
-            degree=self.degree, coef0=self.coef0,
-        )
+        if self.kernel == "precomputed":
+            if X.ndim != 2 or X.shape[1] != self._n_fit:
+                raise ValueError(
+                    f"precomputed transform expects (n_new, n_fit={self._n_fit}), got {X.shape}"
+                )
+            K_new = X
+        else:
+            K_new = pairwise_kernel(
+                X, self.X_fit_,
+                kernel=self.kernel, gamma=self.gamma,
+                degree=self.degree, coef0=self.coef0,
+            )
         # Double-center K_new using the train-fit statistics.
         col_means_new = K_new.mean(axis=1, keepdims=True)            # (n_new, 1)
         Kc_new = K_new - self._row_means[None, :] - col_means_new + self._total_mean
