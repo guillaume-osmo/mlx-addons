@@ -23,9 +23,14 @@ Functions:
 
 from ._wasserstein1d import wasserstein1d_rdm, wasserstein1d_neighbors
 from ._sinkhorn import sinkhorn2_batch
+from ._wemd import wavedecn, wemd_vectors, pairwise_l1, wemd_rdm
 
 __all__ = [
     "wasserstein1d_rdm",
     "wasserstein1d_neighbors",
     "sinkhorn2_batch",
+    "wavedecn",
+    "wemd_vectors",
+    "pairwise_l1",
+    "wemd_rdm",
 ]

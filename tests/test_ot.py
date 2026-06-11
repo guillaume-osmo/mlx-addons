@@ -3,7 +3,10 @@
 import numpy as np
 import pytest
 
-from mlx_addons.ot import wasserstein1d_rdm, wasserstein1d_neighbors, sinkhorn2_batch
+from mlx_addons.ot import (
+    wasserstein1d_rdm, wasserstein1d_neighbors, sinkhorn2_batch,
+    wemd_vectors, pairwise_l1, wemd_rdm,
+)
 
 
 # ──────────────────────────────── 1-D Wasserstein ──
@@ -112,3 +115,52 @@ class TestSinkhorn:
         costs = sinkhorn2_batch(a, b, C, reg=0.05, num_iters=300)
         assert np.all(np.isfinite(costs))
         assert np.all(costs >= 0)
+
+
+# ──────────────────────────────── WEMD (wavelet EMD) ──
+
+class TestWEMD:
+    def test_pairwise_l1_matches_numpy(self):
+        rng = np.random.default_rng(0)
+        V = rng.standard_normal((60, 128)).astype(np.float32)
+        D = pairwise_l1(V)
+        ref = np.abs(V[:, None, :] - V[None, :, :]).sum(-1)
+        np.testing.assert_allclose(D, ref, atol=1e-3, rtol=1e-3)
+        np.testing.assert_allclose(np.diag(D), 0.0, atol=1e-5)
+
+    def test_wemd_approximates_w1_on_smooth_densities(self):
+        """WEMD tracks exact W1 for smooth/overlapping densities (its design regime)."""
+        sp = pytest.importorskip("scipy.stats")
+        pytest.importorskip("pywt")
+        rng = np.random.default_rng(1)
+        B = 256
+        grid = np.arange(B, dtype=float)
+        c = rng.uniform(0.3 * B, 0.7 * B, 60)
+        dens = np.exp(-0.5 * ((grid[None] - c[:, None]) / (B * 0.25)) ** 2)
+        dens /= dens.sum(1, keepdims=True)
+        V = wemd_vectors(dens, wavelet="db2", level=4)
+        D = pairwise_l1(V)
+        pairs = [(int(rng.integers(60)), int(rng.integers(60))) for _ in range(150)]
+        we = np.array([D[i, j] for i, j in pairs])
+        ex = np.array([sp.wasserstein_distance(grid, grid, dens[i], dens[j]) for i, j in pairs])
+        r = sp.pearsonr(we, ex)[0]
+        assert r > 0.9, f"WEMD vs exact W1 Pearson = {r:.3f}"
+
+    def test_wemd_rdm_symmetric_zero_diag(self):
+        pytest.importorskip("pywt")
+        rng = np.random.default_rng(2)
+        B = 128
+        g = np.arange(B, dtype=float)
+        dens = np.exp(-0.5 * ((g[None] - rng.uniform(40, 88, 20)[:, None]) / 20) ** 2)
+        D = wemd_rdm(dens, wavelet="db2", level=3)
+        np.testing.assert_allclose(D, D.T, atol=1e-4)
+        np.testing.assert_allclose(np.diag(D), 0.0, atol=1e-5)
+
+    def test_wavedecn_3d_runs(self):
+        pytest.importorskip("pywt")
+        from mlx_addons.ot import wavedecn
+        rng = np.random.default_rng(3)
+        vol = rng.random((16, 16, 16)).astype(np.float32)
+        details, approx = wavedecn(vol, wavelet="db2", level=2)
+        assert len(details) == 2
+        assert len(details[0]) == 7          # 2^3 - 1 detail sub-bands in 3-D
