@@ -2,15 +2,16 @@
 mlx-addons: GPU-accelerated operations for MLX on Apple Silicon.
 
 Modules:
-    linalg    - Batched linear algebra via Metal GPU kernels (solve, cholesky)
+    linalg    - Batched linear algebra via Metal GPU kernels (solve, cholesky,
+                Gershgorin bounds, density-matrix purification)
+    solvers   - Iterative-solver primitives (Pulay DIIS, commutator residual)
     knn       - K-nearest neighbors via Z-order tree + Metal GPU kernels
     nndescent - Approximate k-NN graph construction via NNDescent (pure MLX)
-    recurrent - Fast LSTM (single + grouped) via fused Metal cell kernels
 """
 
 __version__ = "0.1.0"
 
 from . import linalg
+from . import solvers
 from . import knn
 from . import nndescent
-from . import recurrent
