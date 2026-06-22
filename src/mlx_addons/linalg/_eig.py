@@ -10,12 +10,12 @@ Four primitives:
   density-matrix purification (no diagonalization needed).
 
 - :func:`jacobi_eigh` — batched symmetric eigh on the **Metal GPU** via
-  cyclic Jacobi rotations. Returns ``(w, V)`` for ``N <= 64`` symmetric
+  cyclic Jacobi rotations. Returns ``(w, V)`` for ``N <= 96`` symmetric
   matrices. Closes the "MLX 0.31.x has no GPU eigh" gap for the small-N
   regime that semiempirical SCF lives in (NDDO valence-sp k = 5..50).
 
 - :func:`batched_eigh` — public eigh entry point. Dispatches to
-  :func:`jacobi_eigh` for ``N <= 64`` (Metal GPU), and falls back to
+  :func:`jacobi_eigh` for ``N <= 96`` (Metal GPU), and falls back to
   :func:`mx.linalg.eigh` on the CPU stream otherwise.
 
 - :func:`gen_eigh` — generalized symmetric eigenproblem
@@ -33,10 +33,13 @@ import mlx.core as mx
 
 
 # Maximum public N supported by the Jacobi GPU path. For N <= 32, A and V fit
-# together in fast local storage. For 32 < N <= 64, A stays in threadgroup
-# memory and V is accumulated in the output/device buffer.
-JACOBI_MAX_N = 64
+# together in fast local storage. For 32 < N <= 48, full A stays in
+# threadgroup memory and V is accumulated in the output/device buffer. For
+# 48 < N <= 96, packed symmetric A stays in threadgroup memory while V remains
+# in device memory.
+JACOBI_MAX_N = 96
 JACOBI_RESIDENT_MAX_N = 32
+JACOBI_FULL_VG_MAX_N = 48
 # Threadgroup-specialized buckets for the cooperative kernel. Keeping the
 # threadgroup footprint at 8x8 / 16x16 / 32x32 improves occupancy versus using a
 # single 32x32 kernel for every size.
@@ -58,6 +61,7 @@ JACOBI_TG_AUTO_LIMITS = (
 _jacobi_eigh_kernel_thread = None
 _jacobi_eigh_kernel_tg = {}
 _jacobi_eigh_kernel_vg = {}
+_jacobi_eigh_kernel_vg_packed = {}
 
 
 def _tg_bucket(N: int) -> int:
@@ -454,6 +458,148 @@ def _get_jacobi_eigh_kernel_vg(nmax: int, threads: int):
     return _jacobi_eigh_kernel_vg[key]
 
 
+def _get_jacobi_eigh_kernel_vg_packed(nmax: int, threads: int):
+    """Build (once) the larger-N V-global kernel with packed symmetric A."""
+    global _jacobi_eigh_kernel_vg_packed
+    key = (nmax, threads)
+    if key in _jacobi_eigh_kernel_vg_packed:
+        return _jacobi_eigh_kernel_vg_packed[key]
+    source = r"""
+        constexpr int NMAX = __NMAX__;
+        constexpr int THREADS = __THREADS__;
+        constexpr int SWEEPS = 30;
+        uint b = threadgroup_position_in_grid.x;
+        uint tid = thread_position_in_threadgroup.x;
+        int N = int(A_shape[1]);
+        uint nn = uint(N * N);
+        threadgroup float M[(NMAX * (NMAX + 1)) / 2];
+        threadgroup float rowbuf[NMAX];
+        threadgroup int order[NMAX];
+        threadgroup int did_rotate;
+        auto tri_idx = [](int a, int b) -> int {
+            return (a >= b) ? ((a * (a + 1)) / 2 + b)
+                            : ((b * (b + 1)) / 2 + a);
+        };
+
+        for (uint idx = tid; idx < nn; idx += THREADS) {
+            uint i = idx / uint(N);
+            uint j = idx - i * uint(N);
+            if (i >= j) {
+                M[tri_idx(int(i), int(j))] = A[b * nn + idx];
+            }
+            V[b * nn + idx] = (i == j) ? 1.0f : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+
+        for (int sweep = 0; sweep < SWEEPS; ++sweep) {
+            if (tid == 0) {
+                did_rotate = 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (int p = 0; p < N - 1; ++p) {
+                for (int q = p + 1; q < N; ++q) {
+                    int ipp = tri_idx(p, p);
+                    int iqq = tri_idx(q, q);
+                    int ipq = tri_idx(p, q);
+                    float app = M[ipp];
+                    float aqq = M[iqq];
+                    float apq = M[ipq];
+                    float c = 1.0f;
+                    float s = 0.0f;
+                    if (fabs(apq) > 1e-8f * (fabs(app) + fabs(aqq) + 1.0f)) {
+                        float tau = (aqq - app) / (2.0f * apq);
+                        float t = copysign(1.0f, tau)
+                                  / (fabs(tau) + sqrt(1.0f + tau*tau));
+                        c = rsqrt(1.0f + t*t);
+                        s = t * c;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (s != 0.0f) {
+                        if (tid == 0) {
+                            did_rotate = 1;
+                        }
+                        for (uint k = tid; k < uint(N); k += THREADS) {
+                            if (int(k) != p && int(k) != q) {
+                                int ikp = tri_idx(int(k), p);
+                                int ikq = tri_idx(int(k), q);
+                                float mkp = M[ikp];
+                                float mkq = M[ikq];
+                                M[ikp] = c*mkp - s*mkq;
+                                M[ikq] = s*mkp + c*mkq;
+                            }
+                        }
+                        for (uint k = tid; k < uint(N); k += THREADS) {
+                            uint base = b * nn + k * uint(N);
+                            float vkp = V[base + uint(p)];
+                            float vkq = V[base + uint(q)];
+                            V[base + uint(p)] = c*vkp - s*vkq;
+                            V[base + uint(q)] = s*vkp + c*vkq;
+                        }
+                        threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+                        if (tid == 0) {
+                            M[ipp] = c*c*app - 2.0f*s*c*apq + s*s*aqq;
+                            M[iqq] = s*s*app + 2.0f*s*c*apq + c*c*aqq;
+                            M[ipq] = 0.0f;
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+            if (did_rotate == 0) {
+                break;
+            }
+        }
+
+        if (tid == 0) {
+            for (int i = 0; i < N; ++i) {
+                order[i] = i;
+            }
+            for (int i = 0; i < N - 1; ++i) {
+                int best = i;
+                float best_val = M[tri_idx(order[i], order[i])];
+                for (int j = i + 1; j < N; ++j) {
+                    float val = M[tri_idx(order[j], order[j])];
+                    if (val < best_val) {
+                        best = j;
+                        best_val = val;
+                    }
+                }
+                int tmp = order[i];
+                order[i] = order[best];
+                order[best] = tmp;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint out_col = tid; out_col < uint(N); out_col += THREADS) {
+            int src_col = order[out_col];
+            W[b * uint(N) + out_col] = M[tri_idx(src_col, src_col)];
+        }
+
+        for (uint row = 0; row < uint(N); ++row) {
+            uint base = b * nn + row * uint(N);
+            for (uint col = tid; col < uint(N); col += THREADS) {
+                rowbuf[col] = V[base + col];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint out_col = tid; out_col < uint(N); out_col += THREADS) {
+                int src_col = order[out_col];
+                V[base + out_col] = rowbuf[src_col];
+            }
+            threadgroup_barrier(mem_flags::mem_device | mem_flags::mem_threadgroup);
+        }
+        """
+    source = source.replace("__NMAX__", str(nmax)).replace("__THREADS__", str(threads))
+    _jacobi_eigh_kernel_vg_packed[key] = mx.fast.metal_kernel(
+        name=f"batched_jacobi_eigh_vg_packed_f32_n{nmax}_t{threads}",
+        input_names=["A"],
+        output_names=["W", "V"],
+        source=source,
+    )
+    return _jacobi_eigh_kernel_vg_packed[key]
+
+
 def jacobi_eigh(A: mx.array, *, kernel: str = "auto") -> tuple[mx.array, mx.array]:
     """Batched symmetric eigh on Metal GPU via cyclic Jacobi rotations.
 
@@ -466,8 +612,10 @@ def jacobi_eigh(A: mx.array, *, kernel: str = "auto") -> tuple[mx.array, mx.arra
     - ``"tg"`` — 1 threadgroup = 1 matrix; 8/16/32 threads cooperate on
       row/col and eigenvector updates per rotation, with M and Q in a
       size-specialized threadgroup-shared footprint.
-    - ``"vg"`` — 1 threadgroup = 1 matrix for 32 < N <= 64; A is kept in
-      threadgroup memory and V is accumulated in device/output memory.
+    - ``"vg"`` — 1 threadgroup = 1 matrix for 32 < N <= 96; A is kept in
+      threadgroup memory and V is accumulated in device/output memory. The
+      largest bucket stores A in packed symmetric form to stay under Metal's
+      threadgroup-memory limit.
 
     The auto crossover is size-aware: tiny matrices use the thread kernel for
     high-throughput batches, medium matrices use the cooperative kernel until
@@ -475,7 +623,7 @@ def jacobi_eigh(A: mx.array, *, kernel: str = "auto") -> tuple[mx.array, mx.arra
     the cooperative kernel by default.
 
     Args:
-        A: ``(B, N, N)`` symmetric, float32, ``N <= JACOBI_MAX_N`` (64).
+        A: ``(B, N, N)`` symmetric, float32, ``N <= JACOBI_MAX_N`` (96).
         kernel: ``"auto"`` (default — picks based on ``B``), ``"thread"``,
             ``"tg"``, or ``"vg"``.
 
@@ -501,9 +649,14 @@ def jacobi_eigh(A: mx.array, *, kernel: str = "auto") -> tuple[mx.array, mx.arra
     A_f32 = A.astype(mx.float32) if A.dtype != mx.float32 else A
     use_vg = kernel == "vg" or (kernel == "auto" and N > JACOBI_RESIDENT_MAX_N)
     if use_vg:
-        nmax = 48 if N <= 48 else 64
-        threads = 64
-        kfn = _get_jacobi_eigh_kernel_vg(nmax, threads)
+        if N <= JACOBI_FULL_VG_MAX_N:
+            nmax = 48
+            threads = 64
+            kfn = _get_jacobi_eigh_kernel_vg(nmax, threads)
+        else:
+            nmax = 96
+            threads = 128
+            kfn = _get_jacobi_eigh_kernel_vg_packed(nmax, threads)
         W_unsorted, V_unsorted = kfn(
             inputs=[A_f32],
             grid=(B * threads, 1, 1),

@@ -6,8 +6,8 @@ a meaningful implementation:
 
 - CPU: ``torch.linalg.eigh`` on CPU/Accelerate.
 - Torch MPS: ``metal_linalg.eigh`` / custom Metal Jacobi kernels.
-- MLX: ``mlx_addons.linalg.eigh_small_batch`` / custom MLX Metal kernel for
-  ``n <= 32`` and MLX CPU-stream fallback above that.
+- MLX: ``mlx_addons.linalg.eigh_small_batch`` / custom MLX Metal kernels for
+  ``n <= JACOBI_MAX_N`` and MLX CPU-stream fallback above that.
 
 Run from the repo root:
 
@@ -171,7 +171,16 @@ def main() -> None:
     parser.add_argument(
         "--eigh-cases",
         nargs="+",
-        default=["3:16384", "8:16384", "16:8192", "32:2048", "48:2048", "64:1024"],
+        default=[
+            "3:16384",
+            "8:16384",
+            "16:8192",
+            "32:2048",
+            "48:2048",
+            "64:1024",
+            "72:512",
+            "92:256",
+        ],
         help="Cases as n:batch.",
     )
     parser.add_argument("--warmup", type=int, default=3)

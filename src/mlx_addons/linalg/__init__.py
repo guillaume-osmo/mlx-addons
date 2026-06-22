@@ -29,8 +29,8 @@ Functions:
     slogdet            - Batched signed log-determinant via LU
     logdet_spd         - Batched log-determinant for SPD matrices via GPU Cholesky
     gershgorin_bounds  - Cheap (lo, hi) spectral bracket via Gershgorin disks
-    jacobi_eigh        - Batched symmetric eigh on Metal GPU (N <= 64)
-    batched_eigh       - Public eigh entry; GPU Jacobi for N <= 64, CPU else
+    jacobi_eigh        - Batched symmetric eigh on Metal GPU (N <= 96)
+    batched_eigh       - Public eigh entry; GPU Jacobi for N <= 96, CPU else
     gen_eigh           - Generalized symmetric eigenproblem F C = S C diag(w)
     mcweeny_purify     - Canonical McWeeny density-matrix purification
     sp2_purify         - Niklasson SP2 / TC2 trace-correcting purification
