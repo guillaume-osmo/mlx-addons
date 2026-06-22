@@ -113,6 +113,58 @@ class TestJacobiEigh:
             w_ref = np.sort(np.linalg.eigvalsh(A[i]))
             np.testing.assert_allclose(np.sort(np.array(w[i])), w_ref, atol=1e-3)
 
+    @pytest.mark.parametrize("kernel", ["thread", "tg"])
+    @pytest.mark.parametrize("N", [8, 16, 32])
+    def test_explicit_kernel_variants_match_numpy(self, kernel, N):
+        rng = np.random.default_rng(1000 + N)
+        A = rng.standard_normal((3, N, N)).astype(np.float32)
+        A = (A + np.swapaxes(A, -2, -1)) / 2
+        w, v = jacobi_eigh(mx.array(A), kernel=kernel)
+        mx.eval(w, v)
+        for i in range(3):
+            w_ref = np.sort(np.linalg.eigvalsh(A[i]))
+            np.testing.assert_allclose(np.sort(np.array(w[i])), w_ref, atol=1e-3)
+
+    @pytest.mark.parametrize("N", [48, 64, 72, 92, 96])
+    def test_vglobal_kernel_matches_numpy(self, N):
+        rng = np.random.default_rng(2000 + N)
+        A = rng.standard_normal((2, N, N)).astype(np.float32)
+        A = (A + np.swapaxes(A, -2, -1)) / 2
+        w, v = jacobi_eigh(mx.array(A), kernel="vg")
+        mx.eval(w, v)
+        mx.synchronize()
+        for i in range(2):
+            w_ref = np.sort(np.linalg.eigvalsh(A[i]))
+            np.testing.assert_allclose(np.array(w[i]), w_ref, atol=5e-4)
+
+    @pytest.mark.parametrize("N", [48, 64, 72, 92, 96])
+    def test_batched_eigh_uses_gpu_large_small_path(self, N):
+        rng = np.random.default_rng(3000 + N)
+        A = rng.standard_normal((2, N, N)).astype(np.float32)
+        A = (A + np.swapaxes(A, -2, -1)) / 2
+        w, v = batched_eigh(mx.array(A))
+        mx.eval(w, v)
+        mx.synchronize()
+        assert w.shape == (2, N)
+        assert v.shape == (2, N, N)
+        for i in range(2):
+            w_ref = np.sort(np.linalg.eigvalsh(A[i]))
+            np.testing.assert_allclose(np.array(w[i]), w_ref, atol=5e-4)
+
+    @pytest.mark.parametrize("N", [48, 64, 72, 92, 96])
+    def test_vglobal_eigenvector_residual(self, N):
+        rng = np.random.default_rng(4000 + N)
+        A = rng.standard_normal((1, N, N)).astype(np.float32)
+        A = (A + np.swapaxes(A, -2, -1)) / 2
+        w, v = jacobi_eigh(mx.array(A), kernel="vg")
+        mx.eval(w, v)
+        mx.synchronize()
+        w_np = np.array(w[0])
+        v_np = np.array(v[0])
+        residual = np.linalg.norm(A[0] @ v_np - v_np @ np.diag(w_np)) / np.linalg.norm(A[0])
+        assert residual < 1e-4
+        np.testing.assert_allclose(v_np.T @ v_np, np.eye(N), atol=1e-4)
+
     def test_ascending(self):
         rng = np.random.default_rng(1)
         A = rng.standard_normal((3, 12, 12)).astype(np.float32)

@@ -590,10 +590,26 @@ def cholesky(A: mx.array) -> mx.array:
     return mx.reshape(L_flat, (batch, k, k))
 
 
+def _cpu_solve_with_optional_squeeze(A: mx.array, b: mx.array) -> mx.array:
+    """CPU-stream solve preserving the triangular-solve 2-D RHS convention."""
+    was_2d = b.ndim == 2
+    b_3d = mx.expand_dims(b, -1) if was_2d else b
+    x = mx.linalg.solve(A.astype(mx.float32), b_3d.astype(mx.float32), stream=mx.cpu)
+    return mx.squeeze(x, axis=-1) if was_2d else x
+
+
 def tril_solve(L: mx.array, b: mx.array) -> mx.array:
-    """Solve L @ x = b where L is lower triangular (k <= 128) on GPU."""
+    """Solve L @ x = b where L is lower triangular.
+
+    The Metal kernels cover k <= 80. The old large single-thread tier for
+    standalone triangular solves compiled for 81 <= k <= 128 but produced
+    incorrect residuals, so larger systems use MLX's CPU-stream solver until a
+    blocked or corrected GPU TRSM path lands.
+    """
     batch, k = L.shape[0], L.shape[1]
     assert k <= MAX_GPU_K, f"Matrix size {k} exceeds GPU limit {MAX_GPU_K}"
+    if k > SHARED_K_MAX:
+        return _cpu_solve_with_optional_squeeze(L, b)
     L_flat = mx.reshape(L.astype(mx.float32), (-1,))
     b_flat, m, was_2d = _prep_b(b)
 
@@ -615,9 +631,15 @@ def tril_solve(L: mx.array, b: mx.array) -> mx.array:
 
 
 def triu_solve(L: mx.array, b: mx.array) -> mx.array:
-    """Solve L^T @ x = b where L is lower triangular (k <= 128) on GPU."""
+    """Solve L^T @ x = b where L is lower triangular.
+
+    Uses the Metal triangular kernel for k <= 80 and CPU-stream fallback above
+    that for correctness.
+    """
     batch, k = L.shape[0], L.shape[1]
     assert k <= MAX_GPU_K, f"Matrix size {k} exceeds GPU limit {MAX_GPU_K}"
+    if k > SHARED_K_MAX:
+        return _cpu_solve_with_optional_squeeze(mx.swapaxes(L, -2, -1), b)
     L_flat = mx.reshape(L.astype(mx.float32), (-1,))
     b_flat, m, was_2d = _prep_b(b)
 
