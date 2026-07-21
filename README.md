@@ -317,6 +317,43 @@ distances, indices = knn(pos, k=16)
 
 **Pipeline:** Morton encoding -> Z-order sort -> SoA tree build -> GPU frontier walk -> Metal segmented top-k
 
+### `mlx_addons.neighbors` — Kernel density estimation on GPU
+
+Drop-in replacement for ``sklearn.neighbors.KernelDensity`` — all six sklearn kernels
+(``gaussian``, ``tophat``, ``epanechnikov``, ``exponential``, ``linear``, ``cosine``),
+matching sklearn's density to ~1e-5 (float32). A grid×samples Gaussian KDE is normally
+a huge kernel matrix reduced along one axis; this walks both axes in tiles and
+accumulates, so **peak memory is flat in the sample count** — bounded by
+``query_tile × sample_tile``, not by ``grid × samples``.
+
+```python
+from mlx_addons.neighbors import KernelDensity, bootstrap_kde
+
+kde = KernelDensity(bandwidth=0.2).fit(X)     # X: (n_samples, n_features)
+logp = kde.score_samples(grid)                # matches sklearn
+p = kde.eval_density(grid)                     # == exp(score_samples), cheaper
+
+# Bootstrap density band (the compute core of the "stylized facts" demo):
+band = bootstrap_kde(returns, grid, n_samples=50_000, n_boot=1000, bandwidth=2e-4)
+```
+
+**Gaussian KDE bootstrap — sklearn CPU vs MLX Apple GPU** (100 tickers, 100 bootstraps,
+grid = 5000; timings on an M-series Mac):
+
+| samples | sklearn CPU | MLX (Apple GPU) | speedup | full `grid×N` matrix | tiled peak (measured) |
+|--------:|------------:|----------------:|:-------:|---------------------:|----------------------:|
+|     10K |      32.3 s |          1.55 s | **21×** |               200 MB |                269 MB |
+|     50K |     225.6 s |          7.69 s | **29×** |              1000 MB |                269 MB |
+|    100K |     529.3 s |         15.27 s | **35×** |              2000 MB |                269 MB |
+|    250K |           — |             —   |    —    |              5000 MB |            **271 MB** |
+
+`full grid×N matrix` is the float32 kernel matrix the naive/GPU-library path
+materialises; its measured peak is ~2× that (the matrix **and** its `exp()` are live
+at once — 2000 MB at 50K), and it OOMs past a few hundred K. The tiled path's peak is
+flat in `N`. See [`benchmarks/bench_kde_stylized_facts.py`](benchmarks/bench_kde_stylized_facts.py)
+— an MLX port of the [GPU-Quant-Finance KDE stylized-facts demo](https://github.com/will-hill/GPU-Quant-Finance)
+that swaps NVIDIA cuML for the Apple GPU.
+
 ## Install
 
 ```bash
