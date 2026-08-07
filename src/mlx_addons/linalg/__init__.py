@@ -34,6 +34,8 @@ Functions:
     gen_eigh           - Generalized symmetric eigenproblem F C = S C diag(w)
     mcweeny_purify     - Canonical McWeeny density-matrix purification
     sp2_purify         - Niklasson SP2 / TC2 trace-correcting purification
+    syrk               - Symmetric product X @ X.T at ~half the flops of a GEMM
+    gram               - Gram matrix X.T @ X (syrk with trans=True)
 """
 
 from ._blocked import blocked_cholesky, blocked_solve
@@ -61,6 +63,7 @@ from ._eig import (
 )
 from ._geometry import KabschRMSDResult, kabsch_rmsd
 from ._purification import mcweeny_purify, sp2_purify
+from ._syrk import syrk, gram, BLOCK_ROWS, MIN_DIM, MIN_CONTRACT
 
 # Public API: solve and cholesky handle any matrix size
 solve = blocked_solve
@@ -93,6 +96,11 @@ __all__ = [
     "JACOBI_MAX_N",
     "mcweeny_purify",
     "sp2_purify",
+    "syrk",
+    "gram",
+    "BLOCK_ROWS",
+    "MIN_DIM",
+    "MIN_CONTRACT",
     "MAX_GPU_K",
     "SHARED_K_MAX",
 ]
