@@ -90,7 +90,9 @@ class TestDensityProperties:
         X = rng.standard_normal((4000, 1)).astype(np.float32)
         grid = np.linspace(-8, 8, 8000).reshape(-1, 1).astype(np.float32)
         dens = KernelDensity(bandwidth=0.3).fit(X).eval_density(grid)
-        integral = np.trapz(dens, grid.ravel())
+        # np.trapz was removed in NumPy 2.0 and renamed np.trapezoid.
+        trapezoid = getattr(np, "trapezoid", None) or np.trapz
+        integral = trapezoid(dens, grid.ravel())
         assert abs(integral - 1.0) < 1e-2
 
     def test_1d_and_2d_input_accepted(self):

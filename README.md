@@ -21,49 +21,14 @@ from mlx_addons.decomposition import PCA   # 464 ms
 | [`cluster`](#cluster) | `KMeans` (Lloyd + k-means++), whole loop in MLX ops | **16×** sklearn at n=100k |
 | [`knn`](#knn) | Exact k-NN via Z-order tree + Metal kernels, up to 256 neighbours | 100k points, k=16 |
 | [`nndescent`](#knn) | Approximate k-NN *graph* construction (NNDescent), pure MLX | — |
+| [`ensemble`](#ensemble) | `ExtraTreesRegressorMLXCSR` — CSR/segment-scatter ExtraTrees, no index matrix, zero padding waste | **2.7–4.5×** sklearn above n=20k |
+| [`neighbors`](#neighbors) | `KernelDensity` (all six sklearn kernels) + `bootstrap_kde`, tiled so peak memory is flat in sample count | **21–35×** sklearn; 269 MB at any N |
 | [`solvers`](#solvers) | Pulay DIIS extrapolation + commutator residual, batched | — |
 | [`optimizers`](#optimizers) | `Muon` with SYRK-accelerated Newton–Schulz | 1.14–1.35× end-to-end |
 | [`recurrent`](#recurrent) | `MetalLSTM` / `GroupedMetalLSTM` — fused Metal cell kernels | — |
 | [`fused_rnn`, `fused_gru`](#recurrent) | Whole-sequence LSTM/GRU in **one** JIT Metal kernel, forward + trainable fused BPTT | GRU ~4–7× eager inference, ~17× training |
 
 Full measurements, hardware and methodology: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
-
-### `mlx_addons.neighbors` — Kernel density estimation on GPU
-
-Drop-in replacement for ``sklearn.neighbors.KernelDensity`` — all six sklearn kernels
-(``gaussian``, ``tophat``, ``epanechnikov``, ``exponential``, ``linear``, ``cosine``),
-matching sklearn's density to ~1e-5 (float32). A grid×samples Gaussian KDE is normally
-a huge kernel matrix reduced along one axis; this walks both axes in tiles and
-accumulates, so **peak memory is flat in the sample count** — bounded by
-``query_tile × sample_tile``, not by ``grid × samples``.
-
-```python
-from mlx_addons.neighbors import KernelDensity, bootstrap_kde
-
-kde = KernelDensity(bandwidth=0.2).fit(X)     # X: (n_samples, n_features)
-logp = kde.score_samples(grid)                # matches sklearn
-p = kde.eval_density(grid)                     # == exp(score_samples), cheaper
-
-# Bootstrap density band (the compute core of the "stylized facts" demo):
-band = bootstrap_kde(returns, grid, n_samples=50_000, n_boot=1000, bandwidth=2e-4)
-```
-
-**Gaussian KDE bootstrap — sklearn CPU vs MLX Apple GPU** (100 tickers, 100 bootstraps,
-grid = 5000; timings on an M-series Mac):
-
-| samples | sklearn CPU | MLX (Apple GPU) | speedup | full `grid×N` matrix | tiled peak (measured) |
-|--------:|------------:|----------------:|:-------:|---------------------:|----------------------:|
-|     10K |      32.3 s |          1.55 s | **21×** |               200 MB |                269 MB |
-|     50K |     225.6 s |          7.69 s | **29×** |              1000 MB |                269 MB |
-|    100K |     529.3 s |         15.27 s | **35×** |              2000 MB |                269 MB |
-|    250K |           — |             —   |    —    |              5000 MB |            **271 MB** |
-
-`full grid×N matrix` is the float32 kernel matrix the naive/GPU-library path
-materialises; its measured peak is ~2× that (the matrix **and** its `exp()` are live
-at once — 2000 MB at 50K), and it OOMs past a few hundred K. The tiled path's peak is
-flat in `N`. See [`benchmarks/bench_kde_stylized_facts.py`](benchmarks/bench_kde_stylized_facts.py)
-— an MLX port of the [GPU-Quant-Finance KDE stylized-facts demo](https://github.com/will-hill/GPU-Quant-Finance)
-that swaps NVIDIA cuML for the Apple GPU.
 
 ## Install
 
@@ -98,6 +63,8 @@ disappointing measurement.
 | `csr_matmul` | genuinely sparse, wide left operand | dense-ish input — it scales with `nnz`, so density is the whole story |
 | `syrk` / `gram` | M ≥ `MIN_DIM` (2048) **and** contraction ≥ `MIN_CONTRACT` (1024) | thin-K: 0.65–0.80× at K=256 |
 | `randomized_svd` batched | batch ≥ 4 | **batch = 1** (0.66× — a serial loop is faster) |
+| `ExtraTreesRegressorMLXCSR` | n ≳ 20,000 | **n ≈ 3,000 — 0.99×**, sklearn is level. And it is *not bit-reproducible* — see below |
+| `KernelDensity` | large sample counts, or when the naive path OOMs | tiny problems, where sklearn is already milliseconds |
 | `KMeans` | n ≳ 5000 | n = 1000 (0.6× sklearn) |
 | `PCA`, `Nystroem`, `KernelPCA` | almost always | very small n, where sklearn's full path is already milliseconds |
 
@@ -107,6 +74,12 @@ Two more traps worth stating plainly:
   `repeat=10` and will invent regressions that are not there. Use `repeat ≥ 25`.
 * **Cache.** Call `mx.clear_cache()` between runs, or you will measure the
   allocator rather than the kernel.
+* **`ensemble` is statistically reproducible, not bit-reproducible.** Scatter-add
+  with duplicate indices has no fixed accumulation order on Metal. Over five
+  identical runs the median per-row difference is 6e-8, but the max is 3.6e-2 on
+  6–7 rows in 1000 — rounding occasionally flips a near-tie split and those rows
+  land in a different leaf. R² was stable to six decimals. If you need bit-exact
+  reruns, the reductions have to be ordered deterministically.
 
 ---
 
@@ -212,6 +185,42 @@ km.labels_, km.cluster_centers_, km.predict(X_new)
 Assignment is one Metal matmul + `argmin`; update is a one-hot `.T @ X` matmul.
 No custom kernels — the whole Lloyd loop is MLX ops.
 
+### `ensemble`
+
+```python
+from mlx_addons.ensemble import ExtraTreesRegressorMLXCSR
+
+et = ExtraTreesRegressorMLXCSR(n_estimators=100, max_depth=10,
+                               max_features=1.0, random_state=0).fit(X, y)
+y_pred = et.predict(X_test)
+```
+
+**No index matrix, and no padding.** The obvious way to build trees on a GPU is a
+dense `(m, L)` index matrix per level, padded to the largest node — and it cannot
+win. Measured padding waste at depth 10 is **12–13× serial and 31–41× once the
+forest is batched**, because `L` becomes the forest-wide max child size. Batching
+makes it *worse*.
+
+This module keeps no index matrix at all. It holds one node-assignment vector and
+routes every row elementwise, per level:
+
+```
+node <- 2*node + 1 + (x[row, feat[node]] >= thr[node])
+```
+
+Every per-node statistic is then a segment reduction over that vector, and MLX has
+all three natively as single scatters (`.at[gid].add` / `.minimum` / `.maximum`).
+Memory per level is `O(T·N)` — independent of depth *and* of node-size skew.
+Padding waste: **0×**, and 30× faster than the padded level-wise version.
+
+Two things that were not obvious. Removing the per-level host syncs (~1000 → 10)
+made it **2–3× slower** — the syncs were never the bottleneck, the dense gather
+was. And node layout is the heap (children of `i` at `2i+1`, `2i+2`): packing a
+level as `concatenate([all_left, all_right])` agrees with that only at depth ≤ 1
+and silently corrupts everything below, holding training R² at 0.157 while looking
+structurally plausible. `tests/test_csr_trees.py` guards it via monotonicity of
+training R² in depth.
+
 ### `knn`
 
 ```python
@@ -222,6 +231,28 @@ distances, indices = knn(mx.random.normal((100000, 3)), k=16)   # k up to 256
 Pipeline: Morton encoding → Z-order sort → SoA tree build → GPU frontier walk →
 Metal segmented top-k. For *approximate* k-NN **graphs** rather than exact
 queries, `mlx_addons.nndescent` implements NNDescent in pure MLX.
+
+### `neighbors`
+
+Drop-in for `sklearn.neighbors.KernelDensity` — all six sklearn kernels
+(`gaussian`, `tophat`, `epanechnikov`, `exponential`, `linear`, `cosine`),
+matching sklearn's density to ~1e-5 in float32.
+
+```python
+from mlx_addons.neighbors import KernelDensity, bootstrap_kde, VALID_KERNELS
+
+kde = KernelDensity(bandwidth=0.2).fit(X)     # X: (n_samples, n_features)
+logp = kde.score_samples(grid)                # matches sklearn
+p = kde.eval_density(grid)                    # == exp(score_samples), cheaper
+
+band = bootstrap_kde(returns, grid, n_samples=50_000, n_boot=1000, bandwidth=2e-4)
+```
+
+**Peak memory is flat in the sample count.** A grid×samples KDE is normally one
+huge kernel matrix reduced along an axis; this walks both axes in tiles and
+accumulates, so the peak is bounded by `query_tile × sample_tile` rather than
+`grid × samples` — **269 MB whether N is 10K or 250K**, where the materialised
+path needs 5000 MB at 250K and OOMs not far past it.
 
 ### `solvers`
 
@@ -261,9 +292,16 @@ MPSGraph, and the GRU path is roughly 4–7× eager inference and ~17× training
 ## Benchmarks
 
 Every measured table — Cholesky, QR, rSVD, PCA, Nyström, KernelPCA, random
-projection, CSR matmul, KMeans, Jacobi eigh, SP2 purification, SYRK — lives in
+projection, CSR matmul, KMeans, Jacobi eigh, SP2 purification, SYRK, CSR
+ExtraTrees, KDE — lives in
 **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**, with the hardware and methodology
 for each.
+
+## Acknowledgements
+
+Portions of this project's development were assisted by Claude (Anthropic). All
+commits are authored by the maintainer; Claude was used as a research and
+refactoring aide.
 
 ## License
 
