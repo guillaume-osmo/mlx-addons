@@ -237,3 +237,81 @@ captures both sides. Reproduce with
 
 **Below n ≈ 5000 sklearn wins.** The GPU path only pays off once the matmul is
 large enough to hide the launch.
+
+---
+
+## ensemble
+
+### `ExtraTreesRegressorMLXCSR` vs sklearn
+
+Depth 10, sklearn single-threaded, ExtraTrees regressor:
+
+| n | p | T | MLX | sklearn | ratio | MLX R² | sklearn R² |
+|---:|---:|---:|---:|---:|:---:|---:|---:|
+| 3,000 | 10 | 100 | 0.15 s | 0.15 s | 0.99× | +0.9638 | +0.9668 |
+| 20,000 | 20 | 100 | **0.29 s** | 1.32 s | **4.5×** | — | — |
+| 100,000 | 30 | 100 | **3.32 s** | 9.02 s | **2.7×** | +0.9422 | +0.9412 |
+| 200,000 | 30 | 100 | **7.85 s** | 21.45 s | **2.7×** | — | — |
+| 100,000 | 30 | 300 | **9.76 s** | 28.22 s | **2.9×** | +0.9451 | +0.9406 |
+
+**Faster at every size ≥ 20k, level at 3k**, and 30× faster than the padded
+level-wise design it replaces.
+
+### Why the dense index matrix loses
+
+Padding waste — index-matrix cells touched vs real rows, depth 10:
+
+| Forest | Serial | Batched |
+|---|---:|---:|
+| T=1 | 12.1× | — |
+| T=50 | 13.4× | **41.3×** |
+| T=200 | 12.6× | **39.5×** |
+
+Batching the forest makes it *worse*, because `L` becomes the forest-wide max
+child size. Two intuitive fixes were tried first and both failed:
+
+* **Removing the per-level host syncs** (~1000 → 10 for T=50, d=10): **2–3×
+  slower.** The syncs were never the bottleneck.
+* **Putting trees on the leading axis:** 2–3× slower again, per the waste above.
+
+The dense `(m, L, D)` gather was the cost all along.
+
+### Reproducibility
+
+Statistically reproducible, **not bit-reproducible**. Scatter-add with duplicate
+indices has no fixed accumulation order on Metal. Over five identical runs:
+
+| | value |
+|---|---:|
+| median per-row difference | 6e-8 |
+| max per-row difference | 3.6e-2, on 6–7 rows in 1000 |
+| R² stability | 6 decimals |
+
+Rounding occasionally flips a near-tie split and those rows land in a different
+leaf. Anything needing bit-exact reruns must order the reductions
+deterministically.
+
+---
+
+## neighbors
+
+### Gaussian KDE bootstrap — sklearn CPU vs MLX Apple GPU
+
+100 tickers, 100 bootstraps, grid = 5000:
+
+| samples | sklearn CPU | MLX (Apple GPU) | speedup | full `grid×N` matrix | tiled peak (measured) |
+|---:|---:|---:|:---:|---:|---:|
+| 10K | 32.3 s | **1.55 s** | **21×** | 200 MB | 269 MB |
+| 50K | 225.6 s | **7.69 s** | **29×** | 1000 MB | 269 MB |
+| 100K | 529.3 s | **15.27 s** | **35×** | 2000 MB | 269 MB |
+| 250K | — | — | — | 5000 MB | **271 MB** |
+
+`full grid×N matrix` is the float32 kernel matrix the naive or GPU-library path
+materialises; its measured peak is ~2× that, because the matrix **and** its
+`exp()` are live at once (2000 MB at 50K), and it OOMs past a few hundred K. The
+tiled path's peak is flat in `N`.
+
+See [`benchmarks/bench_kde_stylized_facts.py`](../benchmarks/bench_kde_stylized_facts.py)
+— an MLX port of the
+[GPU-Quant-Finance KDE stylized-facts demo](https://github.com/will-hill/GPU-Quant-Finance)
+that swaps NVIDIA cuML for the Apple GPU.
