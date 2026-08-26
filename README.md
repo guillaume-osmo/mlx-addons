@@ -297,6 +297,12 @@ ExtraTrees, KDE — lives in
 **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**, with the hardware and methodology
 for each.
 
+## Acknowledgements
+
+Portions of this project's development were assisted by Claude (Anthropic). All
+commits are authored by the maintainer; Claude was used as a research and
+refactoring aide.
+
 ## License
 
 MIT
