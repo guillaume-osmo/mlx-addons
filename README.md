@@ -30,6 +30,34 @@ from mlx_addons.decomposition import PCA   # 464 ms
 
 Full measurements, hardware and methodology: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
+### `fused_lstm_ext` — the fused LSTM as a native MLX primitive
+
+`mlx_addons.fused_rnn` builds its kernel at runtime with `mx.fast.metal_kernel`. `fused_lstm_ext/` is the same algorithm compiled as a real MLX C++ primitive (`mx::Primitive` with `eval_gpu` and a C++ `vjp`, nanobind bindings, its own `.metallib`), which is the form MLX would need to adopt it upstream.
+
+```bash
+cd fused_lstm_ext
+pip install -e .          # needs cmake + the Xcode Metal toolchain
+python test_parity.py
+```
+
+```python
+from mlx_fused_lstm import fused_lstm
+h = fused_lstm(x, Wx, Wh, bias, h0, c0)   # x:[B,T,IN] -> h:[B,T,H], differentiable
+```
+
+Forward is bit-identical to the JIT kernel; every gradient matches an eager MLX LSTM to ~2e-7 relative (`test_parity.py`).
+
+**Measured on M3 Max, T=64 IN=128 H=64 (ms/call, lower=better):**
+
+| B   | pass    | eager MLX | JIT kernel | native ext |
+|----:|---------|----------:|-----------:|-----------:|
+| 32  | fwd     |      3.72 |   **0.74** |       1.15 |
+| 32  | fwd+bwd |     13.13 |   **1.15** |       1.93 |
+| 128 | fwd+bwd |     16.30 |   **1.33** |       2.09 |
+| 512 | fwd+bwd |     38.35 |   **2.62** |       3.70 |
+
+The JIT path is still ~1.5x faster, and the reason is specialization rather than the kernel body — both use the same `simdgroup_matrix` inner loop. The JIT version bakes `B, T, H, IN` into the source as literals per shape, so its accumulation loops unroll; the native kernel takes them as `constant uint&` arguments, leaving the trip counts and the index division to run time. Closing the gap means promoting those dims to Metal function constants, which `Device::get_kernel` already accepts via its `MTLFCList` parameter. Until then prefer `mlx_addons.fused_rnn` for speed and this for embedding or upstreaming.
+
 ## Install
 
 ```bash
