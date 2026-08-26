@@ -1,381 +1,32 @@
 # mlx-addons
 
-GPU-accelerated operations for [MLX](https://github.com/ml-explore/mlx) on Apple Silicon. Custom Metal compute kernels for operations that are missing or CPU-only in core MLX.
+**GPU-accelerated operations for [MLX](https://github.com/ml-explore/mlx) on
+Apple Silicon** — Metal compute kernels for things that are missing from core
+MLX, or that only run on its CPU stream.
 
-## Patterns & recipes
-
-Three recipes that come up repeatedly — each documented with a measured improvement on real data.
-
-### 1. Swap `sklearn.decomposition.PCA` → `mlx_addons.decomposition.PCA`
-
-Drop-in replacement backed by Metal randomized SVD.
+Most of it is a drop-in replacement for something you already use: swap the
+import, keep the code.
 
 ```python
-# Before:
-from sklearn.decomposition import PCA
-# After:
-from mlx_addons.decomposition import PCA
+from sklearn.decomposition import PCA      # 9.4 s
+from mlx_addons.decomposition import PCA   # 464 ms
 ```
 
-**Measured on ChemeleonSMD fingerprints (35633 × 2048 float32):**
-
-| PCA dim | sklearn PCA | mlx_addons PCA | speedup |
-|--------:|------------:|---------------:|:-------:|
-|      64 |      9.4 s  |        464 ms  | **20×** |
-|     128 |      9.7 s  |        651 ms  | **15×** |
-|     192 |     10.1 s  |        893 ms  | **11×** |
-
-### 2. Ensemble random projection for robustness + accuracy
-
-Single PCA is sensitive to noisy top eigenvectors on ill-conditioned data; single random projection has high variance; **averaging a few of each hits a lower RMSE than either alone**.
-
-```python
-from mlx_addons.decomposition import EnsembleRandomProjection, ensemble_mean_predict
-
-ens = EnsembleRandomProjection(
-    n_components=128, n_pca=1, n_sparse=2, n_gaussian=2, random_state=42,
-).fit(X_all_molecules)     # global, unsupervised
-
-def fit_predict(Ztr, ytr, Zte):
-    return TabICLRegressorMLX(n_estimators=8, random_state=42).fit(Ztr, ytr).predict(Zte).flatten()
-
-y_pred = ensemble_mean_predict(ens, fit_predict, X_train, y_train, X_test)
-```
-
-**MoleculeACE ChemeleonSMD v5 × PCA=128 × TabICL-MLX (first 10 targets, mean RMSE):**
-
-| Feature transform               | Mean RMSE | Δ vs PCA |
-|---------------------------------|----------:|---------:|
-| PCA (single)                    | 0.6281    | —        |
-| SparseRP × 5                    | 0.6239    | −0.0042  |
-| GaussianRP × 5                  | 0.6241    | −0.0040  |
-| **PCA + 2 SRP + 2 GRP (mix)**   | **0.6215**| **−0.0066** |
-
-Why it works — PCA captures high-variance directions; RPs preserve distances uniformly (JL lemma); averaging cancels per-basis variance. See [`benchmarks/bench_ensemble_rp.py`](benchmarks/bench_ensemble_rp.py).
-
-### 3. Use `csr_matmul` when your left operand is sparse + wide
-
-Writing `A @ B` as dense in MLX gives Metal's optimized GEMM but does all the zero multiplies. For genuine sparse workloads (graph Laplacians, message passing, one-hot features), the CSR path skips them.
-
-```python
-from mlx_addons.linalg import csr_matmul, csr_from_dense
-
-indptr, indices, values = csr_from_dense(A)
-C = csr_matmul(indptr, indices, values, B, M=A.shape[0])
-```
-
-Measured up to **622× faster than dense matmul** at 0.2% density on (10000, 32768) × (32768, 128). Scales with ``nnz``, not ``M × K``.
-
----
-
-## Features
-
-### `mlx_addons.linalg` — Batched Linear Algebra on GPU
-
-Metal GPU kernels for Cholesky, solve, QR, determinant, and triangular solve on batched matrices of **any size**. Three kernel tiers for maximum performance:
-
-1. **Per-thread** (k <= 32): one thread per matrix, device memory. Best for small k with large batches.
-2. **Threadgroup-cooperative** (k 33-80): threadgroup shared memory, parallel column updates. Best throughput for medium k.
-3. **Blocked** (k > 80): tiled algorithm with GPU matmul for SYRK updates. Scales to any size.
-
-```python
-from mlx_addons.linalg import solve, cholesky, qr
-
-# Solve A @ x = b for 10,000 matrices at once — on GPU
-A = mx.array(...)  # (10000, 64, 64) SPD matrices
-b = mx.array(...)  # (10000, 64, 1)
-x = solve(A, b)    # 30ms on GPU vs 311ms on CPU
-
-Q, R = qr(A_small) # Householder QR, up to 10-29x faster than CPU
-```
-
-#### Cholesky Solve (batch = 10K, M3 Max)
-
-| k  | CPU (ms) | GPU (ms) | Speedup |
-|---:|---------:|---------:|--------:|
-|  5 |      7.7 |     0.63 | **12x** |
-| 15 |     24.8 |     0.97 | **26x** |
-| 30 |     72.0 |     2.20 | **33x** |
-| 48 |    176.4 |    10.51 | **17x** |
-| 64 |    310.7 |    29.62 | **10x** |
-| 80 |    569.4 |    66.64 |  **9x** |
-
-Scales to any matrix size via blocked algorithm (k > 80 uses 80-block Cholesky + GPU matmul):
-
-| k (batch=1K) | CPU (ms) | GPU (ms) | Speedup |
-|--------------:|---------:|---------:|--------:|
-| 128           |    102.2 |     14.4 |  **7x** |
-| 256           |    436.5 |     59.9 |  **7x** |
-| 512           |   1691.1 |    222.3 |  **8x** |
-
-#### QR Factorization (batch = 10K, M3 Max)
-
-Uses threadgroup-cooperative Metal kernel with shared memory for both Q and R matrices. Parallelises Householder reflector application across rows and columns.
-
-| k  | CPU (ms) | GPU (ms) | Speedup |
-|---:|---------:|---------:|--------:|
-| 16 |     26.4 |     0.85 | **31x** |
-| 20 |     35.6 |     1.43 | **25x** |
-| 32 |     75.1 |     7.55 | **10x** |
-| 48 |    155.4 |    32.94 |  **5x** |
-| 63 |    294.4 |    93.20 |  **3x** |
-
-For k > 63, falls back to CPU LAPACK (the threadgroup memory limit of 32 KB fits two k*k matrices up to k=63).
-
-**Functions:** `solve`, `cholesky`, `qr`, `tril_solve`, `triu_solve`, `det`, `slogdet`, `logdet_spd`
-
-#### Randomized Truncated SVD (Halko-Martinsson-Tropp)
-
-Metal GPU matmul for the range-finding, projection and lift steps; CPU MLX stream for the QR on the ``(n, k+p)`` basis and the small ``(k+p, m)`` final SVD. Subspace iteration with re-orthogonalization (Halko-Martinsson-Tropp Algorithm 4.4). Dramatically faster than scipy ARPACK for low-rank truncation:
-
-| Matrix shape      | k  | scipy ARPACK | sklearn randomized | MLX full CPU SVD | **mlx_addons rSVD** |
-|:------------------|---:|-------------:|-------------------:|-----------------:|--------------------:|
-| (633, 128)        | 32 |      394 ms  |            501 ms  |           12 ms  |           **8 ms**  |
-| (2000, 512)       | 32 |      13.1 s  |             1.4 s  |           92 ms  |          **12 ms**  |
-| (5000, 1024)      | 64 |      21.6 s  |             3.9 s  |           928 ms |          **46 ms**  |
-| (10000, 2048)     | 32 |  ~30 s†      |             3.4 s  |           4.4 s  |          **59 ms**  |
-
-† ARPACK skipped above 5000×1024 in the default benchmark (takes 30+ s per call). All measurements on M3 Max with ``mx.clear_cache()`` between runs.
-
-```python
-from mlx_addons.linalg import randomized_svd, TruncatedSVD
-
-U, S, Vt = randomized_svd(X, n_components=32, n_iter=4)
-
-# sklearn-compatible class
-svd = TruncatedSVD(n_components=32).fit(X)
-Z = svd.transform(X)         # (n_samples, 32) low-rank projection
-```
-
-**Functions:** `randomized_svd`, `TruncatedSVD`
-
-Batched input is supported: pass an array of shape ``(batch, n, m)`` and all matmuls (``X @ Ω``, ``X.mT @ Y``, ``Q.mT @ X``, ``Q @ Û``) go through a single Metal dispatch. The QR and final SVD run on MLX CPU stream but use batched LAPACK, so B independent low-rank truncations cost much less than B calls. Typical speedups vs a serial Python loop at (n=500, m=128, k=16):
-
-| batch | serial loop | **batched** | speedup |
-|------:|------------:|------------:|--------:|
-|   1   |     3.8 ms  |    5.7 ms   |  0.66×  |
-|   4   |    19.9 ms  |    6.7 ms   |  **3.0×**  |
-|   8   |    34.7 ms  |    9.5 ms   |  **3.6×**  |
-|  16   |    66.3 ms  |   12.2 ms   |  **5.4×**  |
-|  32   |   128.3 ms  |   23.0 ms   |  **5.6×**  |
-
-```python
-# 8 independent truncations in one call
-U, S, Vt = randomized_svd(X_batch, n_components=32)   # X_batch: (8, n, m)
-```
-
-#### Symmetric eigensolver helpers and density-matrix purification
-
-Spectral primitives for SCF and quantum-chemistry workloads.
-
-```python
-from mlx_addons.linalg import (
-    gershgorin_bounds, jacobi_eigh, batched_eigh, gen_eigh,
-    sp2_purify, mcweeny_purify,
-)
-
-lo, hi = gershgorin_bounds(F)            # cheap (lo, hi) bracket on the spectrum
-w, V = jacobi_eigh(F_batch)              # Metal GPU eigh via cyclic Jacobi (N <= 32)
-w, V = batched_eigh(F)                   # auto-dispatch: GPU Jacobi for small N, CPU else
-w, C = gen_eigh(F, S)                    # generalized: F C = S C diag(w), S SPD
-
-# Build the closed-shell one-electron density (eigh-free), trace = n_occ:
-rho = sp2_purify(F, n_occ)               # Niklasson SP2 / TC2 — cold-start, batched
-rho = mcweeny_purify(F, rho_warm)        # canonical 3rho^2 - 2rho^3 — warm-start refinement
-```
-
-`jacobi_eigh` closes the "MLX 0.31.x has no GPU eigh" gap for the small-N regime that semiempirical SCF lives in. Two kernel variants are auto-dispatched by batch size: a **thread-local** kernel (1 GPU thread = 1 matrix) for large batches where launch overhead is amortized, and a **threadgroup-cooperative** kernel (1 threadgroup of 64 threads = 1 matrix, parallel row/col updates per rotation) for small batches where per-rotation parallelism wins. Crossover is around `B = JACOBI_TG_BATCH_THRESHOLD` (256) on M-series silicon. Speedup vs MLX's CPU-stream `eigh`, **best of the two kernels**:
-
-| B | k=8 | k=16 | k=24 | k=32 |
-|---:|---:|---:|---:|---:|
-|   100 |   0.44× |   0.81× |   0.83× |   0.80× |
-|   500 | **3.4×** | **1.4×** | **1.5×** | **1.3×** |
-|  1000 | **3.3×** | **2.9×** | **1.7×** | **1.5×** |
-|  2000 | **6.8×** | **5.5×** | **2.7×** | **1.6×** |
-
-Below B ≈ 100 the GPU launch overhead dominates and the CPU stream is faster regardless. Above ≈ 500, GPU Jacobi pulls ahead — and the gap widens with B. Sweet spot for batched semiempirical SCF (mlxmolkit's RM1, AM1, and the upcoming xTB GFN0/1/2 with k = 5..32, B = 100s-1000s). Override the dispatch with `kernel="thread"` or `kernel="tg"` if you have a specific size profile in mind.
-
-The crossover where SP2 starts beating dense `eigh` on Apple silicon (the published threshold for GPU SP2 vs LAPACK is N ≈ 1000–2000):
-
-| N | n_occ | `eigh` (ms) | `sp2_purify` (ms) | speedup |
-|---:|------:|------------:|------------------:|:-------:|
-|   10 |   2 |        0.21 |              7.04 |   0.03× |
-|   50 |  12 |        0.16 |              6.10 |   0.03× |
-|  200 |  50 |        2.12 |             17.23 |   0.12× |
-| 1000 | 250 |       83.69 |             33.73 | **2.48×** |
-
-Below ~500 basis functions, `eigh` wins decisively (per-launch overhead dominates the tiny matmuls). Above ~1000, SP2's matmul-only inner loop pulls ahead. Use SP2 when N is large or when an eigendecomposition is otherwise unavailable; use `eigh` for small Fock matrices.
-
-**Functions:** `gershgorin_bounds`, `batched_eigh`, `sp2_purify`, `mcweeny_purify`.
-
-### `mlx_addons.solvers` — Iterative-solver primitives
-
-```python
-from mlx_addons.solvers import pulay_diis, commutator_error
-
-# Standard SCF DIIS error vector (orthogonal basis):
-e = commutator_error(F, P)               # F @ P - P @ F
-
-# Extrapolate F from a history of (F_i, e_i) pairs:
-F_extrap = pulay_diis(F_history, e_history, max_history=6)
-```
-
-Pulay's DIIS extrapolator solves the augmented `(nd+1) × (nd+1)` Pulay system via `mlx_addons.linalg.solve_lu` (general LU, Metal-accelerated). Batched over leading dims; per-molecule extrapolation in a single call.
-
-**Functions:** `pulay_diis`, `commutator_error`.
-
-### `mlx_addons.decomposition` — sklearn-style decompositions on GPU
-
-#### Randomized PCA
-
-Drop-in replacement for ``sklearn.decomposition.PCA`` backed by `randomized_svd`: mean-centering + Metal-accelerated SVD. Supports `transform` / `inverse_transform` / `whiten` / `explained_variance_ratio_`.
-
-| Matrix shape      | k  | sklearn full | sklearn randomized | **mlx_addons PCA** |
-|:------------------|---:|-------------:|-------------------:|-------------------:|
-| (633, 128)        | 32 |     13 ms    |            371 ms  |          **8 ms**  |
-| (2000, 512)       | 32 |    137 ms    |           3.7 s    |         **18 ms**  |
-| (5000, 1024)      | 64 |    664 ms    |           7.4 s    |         **48 ms**  |
-| (10000, 2048)     | 32 |    4.0 s     |           6.8 s    |         **85 ms**  |
-
-```python
-from mlx_addons.decomposition import PCA
-
-pca = PCA(n_components=32, whiten=False, random_state=0).fit(X)
-Z = pca.transform(X_new)                 # (n_samples, 32)
-X_hat = pca.inverse_transform(Z)         # lossy reconstruction
-print(pca.explained_variance_ratio_)     # descending
-```
-
-#### Nyström kernel approximation + KernelPCA
-
-Drop-in replacements for ``sklearn.kernel_approximation.Nystroem`` and ``sklearn.decomposition.KernelPCA``. Kernel matrix construction (RBF / polynomial / linear / sigmoid) runs via Metal matmul: one ``X @ Y.T`` for the pairwise inner products plus elementwise ops for the kernel function. Eigendecomposition on the small (m × m) or (n × n) kernel matrix runs on MLX CPU stream via ``mx.linalg.eigh``.
-
-| Method | shape | sklearn | **mlx_addons** | speedup |
-|:-------|:------|--------:|---------------:|:-------:|
-| Nystroem   | n=1000, d=20,  m=100  | 233 ms | **2 ms**  | **109×** |
-| Nystroem   | n=5000, d=50,  m=300  | 332 ms | **6 ms**  | **54×**  |
-| Nystroem   | n=10000, d=100, m=500 | 388 ms | **14 ms** | **27×**  |
-| KernelPCA  | n=500,  d=10, k=20    | 310 ms | **20 ms** | **16×**  |
-| KernelPCA  | n=1500, d=30, k=40    | 505 ms | **134 ms**| **3.8×** |
-| KernelPCA  | n=3000, d=50, k=60    | 1.4 s  | **693 ms**| **2.0×** |
-
-```python
-from mlx_addons.decomposition import Nystroem, KernelPCA, pairwise_kernel
-
-# Nyström: φ(x) Metal-accelerated feature map, Z Z.T ≈ K_rbf(X, X)
-ny = Nystroem(n_components=100, kernel="rbf", gamma=0.1).fit(X_train)
-Z_train = ny.transform(X_train)
-Z_test  = ny.transform(X_test)
-
-# Kernel PCA
-kpca = KernelPCA(n_components=16, kernel="rbf", gamma=0.1).fit(X_train)
-Z = kpca.transform(X_test)
-
-# Raw kernel matrix if you need it
-K = pairwise_kernel(X, Y, kernel="rbf", gamma=0.1)   # (N, M)
-```
-
-#### Random projection (Johnson-Lindenstrauss)
-
-sklearn-compatible ``GaussianRandomProjection`` and ``SparseRandomProjection`` (Achlioptas / Li). Projection is one Metal matmul; ``SparseRandomProjection`` can optionally keep its matrix in CSR format (``store_sparse=True``) for downstream GNN-shape SpMM, but the dense path is faster at RP-typical shapes (small ``k``, large ``n_samples``).
-
-| shape                    | k   | sklearn Gaussian | **ours** | speedup |
-|:-------------------------|----:|-----------------:|---------:|--------:|
-| n=5000,  d=2048          | 128 |            17 ms |   **8 ms** |  **2.2×** |
-| n=10000, d=4096          | 128 |            56 ms |  **12 ms** |  **4.6×** |
-| n=1000,  d=16384         | 256 |            98 ms |  **32 ms** |  **3.1×** |
-
-```python
-from mlx_addons.decomposition import GaussianRandomProjection, SparseRandomProjection, johnson_lindenstrauss_min_dim
-
-# k chosen automatically to preserve pairwise distances to (1 ± eps)
-rp = GaussianRandomProjection(n_components="auto", eps=0.2, random_state=0).fit(X)
-Z = rp.transform(X)
-
-# Ternary {-s, 0, +s} sparse matrix (Achlioptas density = 1/sqrt(d) by default)
-rp = SparseRandomProjection(n_components=128, random_state=0).fit(X)
-```
-
-#### EnsembleRandomProjection — mixed PCA + RP ensemble
-
-```python
-from mlx_addons.decomposition import EnsembleRandomProjection, ensemble_mean_predict
-
-ens = EnsembleRandomProjection(
-    n_components=128, n_pca=1, n_sparse=2, n_gaussian=2, random_state=42,
-).fit(X_all)                                    # fits 5 feature maps at once
-Z = ens.transform(X_all)                        # (5, n_samples, 128) stacked views
-
-# Typical pattern: fit your regressor on each member, average predictions.
-def fit_predict(Ztr, ytr, Zte):
-    return YourRegressor(...).fit(Ztr, ytr).predict(Zte)
-
-y_pred = ensemble_mean_predict(ens, fit_predict, X_train, y_train, X_test)
-```
-
-**Measured improvement on MoleculeACE** (ChemeleonSMD v5 fingerprints → 128-d → TabICL-MLX, first 10 targets):
-
-| Feature transform | Mean RMSE | Δ vs PCA |
-|:------------------|----------:|---------:|
-| PCA (single)                    | 0.6281 | — |
-| SparseRP × 5 (seeds averaged)   | 0.6239 | −0.0042 |
-| GaussianRP × 5                  | 0.6241 | −0.0040 |
-| **PCA + 2 SRP + 2 GRP (default recipe)** | **0.6215** | **−0.0066** ✅ |
-
-PCA wins individually on large, well-conditioned datasets (CHEMBL204, 214); RP ensembles win on small / ill-conditioned ones (CHEMBL1871 −0.028, CHEMBL1862 −0.034). The mix captures both sides.
-
-#### Sparse matmul (CSR × dense) on Metal
-
-A general-purpose SpMM primitive, not tied to random projection. One Metal thread per output element; scales with ``nnz``, not ``M × K``. Dramatic wins on highly-sparse wide inputs (think graph Laplacians, GNN message passing, one-hot feature matrices):
-
-| (M, K, N) | density | nnz | dense matmul | **csr_matmul** | speedup |
-|:----------|:-------:|----:|-------------:|---------------:|--------:|
-| (1000, 2048, 64)    | 2.0% |   41k |   1.5 ms |  **0.1 ms** |   **27×** |
-| (1000, 8192, 64)    | 1.0% |   82k |   8.8 ms |  **0.1 ms** |  **167×** |
-| (5000, 16384, 64)   | 0.5% |  409k |    65 ms |  **0.1 ms** |  **535×** |
-| (10000, 32768, 128) | 0.2% |  655k |   219 ms |  **0.4 ms** |  **622×** |
-
-```python
-from mlx_addons.linalg import csr_matmul, csr_from_dense
-indptr, indices, values = csr_from_dense(A)       # (M, K) dense → CSR
-C = csr_matmul(indptr, indices, values, B, M=A.shape[0])   # (M, K) @ (K, N) → (M, N)
-```
-
-### `mlx_addons.cluster` — Clustering on GPU
-
-#### KMeans (Lloyd's algorithm, k-means++ init)
-
-Assignment = one Metal matmul + ``argmin``; update = one-hot ``.T @ X`` matmul. No custom kernels — the whole Lloyd loop is expressed in MLX ops.
-
-| Shape                    | sklearn | **mlx_addons** | speedup |
-|:-------------------------|--------:|---------------:|:-------:|
-| n=1000,   d=16,  k=8     |   15 ms |    25 ms       | 0.6×    |
-| n=5000,   d=32,  k=16    |   42 ms |    36 ms       | 1.2×    |
-| n=10000,  d=64,  k=32    |  351 ms |    79 ms       | **4.4×** |
-| n=50000,  d=64,  k=32    |  1.2 s  |   133 ms       | **8.8×** |
-| n=100000, d=128, k=64    |  7.4 s  |   465 ms       | **16×**  |
-
-```python
-from mlx_addons.cluster import KMeans
-
-km = KMeans(n_clusters=32, n_init=3, random_state=0).fit(X)
-labels = km.labels_                 # (n_samples,)
-centers = km.cluster_centers_       # (n_clusters, n_features)
-new_labels = km.predict(X_new)
-```
-
-### `mlx_addons.knn` — K-Nearest Neighbors on GPU
-
-Z-order tree construction + Metal GPU kernels for batched distance computation and segmented top-k selection. Supports up to **256 neighbors**.
-
-```python
-from mlx_addons.knn import knn
-
-pos = mx.random.normal((100000, 3))
-distances, indices = knn(pos, k=16)
-```
-
-**Pipeline:** Morton encoding -> Z-order sort -> SoA tree build -> GPU frontier walk -> Metal segmented top-k
+## What's in the box
+
+| Module | What it gives you | Headline |
+|---|---|---|
+| [`linalg`](#linalg) | Batched Cholesky / solve / QR / det / triangular solve on **any** matrix size; randomized SVD; symmetric eigensolvers; density-matrix purification; CSR sparse matmul; SYRK | `solve` **33×** CPU at k=30; `csr_matmul` **622×** dense at 0.2% density |
+| [`decomposition`](#decomposition) | sklearn-style `PCA`, `TruncatedSVD`, `Nystroem`, `KernelPCA`, Gaussian/Sparse random projection, and a mixed PCA+RP ensemble | `PCA` **11–20×** sklearn; `Nystroem` **109×** |
+| [`cluster`](#cluster) | `KMeans` (Lloyd + k-means++), whole loop in MLX ops | **16×** sklearn at n=100k |
+| [`knn`](#knn) | Exact k-NN via Z-order tree + Metal kernels, up to 256 neighbours | 100k points, k=16 |
+| [`nndescent`](#knn) | Approximate k-NN *graph* construction (NNDescent), pure MLX | — |
+| [`solvers`](#solvers) | Pulay DIIS extrapolation + commutator residual, batched | — |
+| [`optimizers`](#optimizers) | `Muon` with SYRK-accelerated Newton–Schulz | 1.14–1.35× end-to-end |
+| [`recurrent`](#recurrent) | `MetalLSTM` / `GroupedMetalLSTM` — fused Metal cell kernels | — |
+| [`fused_rnn`, `fused_gru`](#recurrent) | Whole-sequence LSTM/GRU in **one** JIT Metal kernel, forward + trainable fused BPTT | GRU ~4–7× eager inference, ~17× training |
+
+Full measurements, hardware and methodology: **[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**.
 
 ## Install
 
@@ -383,19 +34,199 @@ distances, indices = knn(pos, k=16)
 pip install mlx-addons
 ```
 
-Or from source:
+From source:
 
 ```bash
 git clone https://github.com/guillaume-osmo/mlx-addons.git
-cd mlx-addons
-pip install -e .
+cd mlx-addons && pip install -e .
 ```
 
-## Requirements
+**Requirements:** macOS on Apple Silicon (M1–M4), Python ≥ 3.10, MLX ≥ 0.20.
 
-- macOS with Apple Silicon (M1/M2/M3/M4)
-- Python >= 3.10
-- MLX >= 0.20.0
+---
+
+## Read this before you benchmark it
+
+A GPU kernel is not uniformly faster. Every path here has a size below which
+launch overhead dominates and the CPU stream wins — and the useful thing this
+README can tell you is *where that line is*, so you do not discover it as a
+disappointing measurement.
+
+| Path | Use it when | It **loses** when |
+|---|---|---|
+| `solve`, `cholesky` | any k, large batch | batch is small (per-launch overhead) |
+| `qr` | k ≤ 63 | k > 63 — **falls back to CPU LAPACK** (32 KB threadgroup limit fits two k×k up to 63) |
+| `jacobi_eigh` | B ≳ 500 | **B ≲ 100** — CPU stream is faster at every k |
+| `sp2_purify` | N ≳ 1000 | **N ≲ 500** — `eigh` wins decisively (0.03× at N=50) |
+| `csr_matmul` | genuinely sparse, wide left operand | dense-ish input — it scales with `nnz`, so density is the whole story |
+| `syrk` / `gram` | M ≥ `MIN_DIM` (2048) **and** contraction ≥ `MIN_CONTRACT` (1024) | thin-K: 0.65–0.80× at K=256 |
+| `randomized_svd` batched | batch ≥ 4 | **batch = 1** (0.66× — a serial loop is faster) |
+| `KMeans` | n ≳ 5000 | n = 1000 (0.6× sklearn) |
+| `PCA`, `Nystroem`, `KernelPCA` | almost always | very small n, where sklearn's full path is already milliseconds |
+
+Two more traps worth stating plainly:
+
+* **Benchmark noise.** Below 4096 the sub-millisecond shapes swing ±15% at
+  `repeat=10` and will invent regressions that are not there. Use `repeat ≥ 25`.
+* **Cache.** Call `mx.clear_cache()` between runs, or you will measure the
+  allocator rather than the kernel.
+
+---
+
+## API reference
+
+### `linalg`
+
+Batched linear algebra via Metal. Three kernel tiers are dispatched by matrix
+size: **per-thread** (k ≤ 32, one thread per matrix), **threadgroup-cooperative**
+(k 33–80, shared memory, parallel column updates), and **blocked** (k > 80,
+tiled with GPU matmul for the SYRK updates) — so there is no size ceiling.
+
+| Group | Functions |
+|---|---|
+| Solve & factor | `solve`, `solve_cholesky`, `solve_lu`, `cholesky`, `qr`, `tril_solve`, `triu_solve` |
+| Determinants | `det`, `slogdet`, `logdet_spd` |
+| Low-rank | `randomized_svd`, `TruncatedSVD` |
+| Sparse | `csr_matmul`, `csr_from_dense` |
+| Symmetric eigen | `jacobi_eigh`, `batched_eigh`, `eigh_small_batch`, `gen_eigh`, `gershgorin_bounds` |
+| 3×3 fast paths | `eigh_symmetric_3x3`, `principal_axes_3x3` |
+| Geometry | `kabsch_rmsd`, `KabschRMSDResult` |
+| Purification | `sp2_purify`, `mcweeny_purify` |
+| Symmetric matmul | `syrk`, `gram` |
+
+```python
+from mlx_addons.linalg import solve, qr, randomized_svd, csr_matmul, syrk
+
+A = mx.array(...)          # (10000, 64, 64) SPD
+x = solve(A, mx.array(...))          # 30 ms GPU vs 311 ms CPU
+Q, R = qr(A_small)                   # Householder QR
+U, S, Vt = randomized_svd(X, n_components=32, n_iter=4)
+G = syrk(X)                          # X @ X.T at ~half the flops
+```
+
+`randomized_svd` accepts batched input `(batch, n, m)`: all four matmuls go
+through a single Metal dispatch, and the QR and final small SVD use batched
+LAPACK on the CPU stream. See the crossover table above — batch 1 loses.
+
+**Symmetric eigensolvers.** `jacobi_eigh` closes the "MLX has no GPU `eigh`" gap
+for the small-N regime that semiempirical SCF lives in. It supports
+`N ≤ JACOBI_MAX_N` (**96**) and auto-dispatches between three kernels — a
+thread-local one (1 thread = 1 matrix, for large batches), a
+threadgroup-cooperative one (1 threadgroup = 1 matrix, parallel row/col updates
+per rotation, for small batches), and a vector-group variant above
+`JACOBI_RESIDENT_MAX_N` (32). The cooperative crossover is size-aware rather
+than a single number — `JACOBI_TG_AUTO_LIMITS` maps a size band to the largest
+batch that still prefers it. Force one with `kernel="thread" | "tg" | "vg"`.
+
+**`syrk` takes the symmetry saving MLX does not.** MLX dispatches `X @ X.T` to
+the same general GEMM as `X @ Y` and pays full price (M4 Pro, bf16, 8192²:
+151.2 vs 149.4 ms). Splitting `X` into `k` row-blocks and computing only the
+`k(k+1)/2` upper-triangular output blocks costs `(1 + 1/k)/2` of the flops —
+1.68× at 8192². No custom Metal kernel: one would have to beat `steel_gemm`
+(already ~78% of the M4 Pro's fp32 peak) for at most ~1.15× more.
+
+### `decomposition`
+
+sklearn-compatible, backed by `randomized_svd` and Metal matmul.
+
+| Class / function | sklearn equivalent |
+|---|---|
+| `PCA` | `sklearn.decomposition.PCA` — with `transform`, `inverse_transform`, `whiten`, `explained_variance_ratio_` |
+| `TruncatedSVD` | `sklearn.decomposition.TruncatedSVD` |
+| `Nystroem` | `sklearn.kernel_approximation.Nystroem` (RBF / poly / linear / sigmoid) |
+| `KernelPCA` | `sklearn.decomposition.KernelPCA` |
+| `GaussianRandomProjection`, `SparseRandomProjection` | `sklearn.random_projection.*` (Achlioptas / Li) |
+| `johnson_lindenstrauss_min_dim` | `sklearn.random_projection.johnson_lindenstrauss_min_dim` |
+| `pairwise_kernel` | raw kernel matrix, if you need it |
+| `EnsembleRandomProjection`, `ensemble_mean_predict` | *no equivalent* — see below |
+
+**`EnsembleRandomProjection` is the one thing here with no sklearn counterpart,
+and the only one that changes accuracy rather than speed.** A single PCA is
+sensitive to noisy top eigenvectors on ill-conditioned data; a single random
+projection has high variance; averaging a few of each beats either alone.
+
+```python
+from mlx_addons.decomposition import EnsembleRandomProjection, ensemble_mean_predict
+
+ens = EnsembleRandomProjection(
+    n_components=128, n_pca=1, n_sparse=2, n_gaussian=2, random_state=42,
+).fit(X_all)                       # global, unsupervised — fits 5 feature maps
+
+def fit_predict(Ztr, ytr, Zte):
+    return YourRegressor(...).fit(Ztr, ytr).predict(Zte)
+
+y_pred = ensemble_mean_predict(ens, fit_predict, X_train, y_train, X_test)
+```
+
+On MoleculeACE (ChemeleonSMD v5 → 128-d → TabICL-MLX, first 10 targets), the
+default 1 PCA + 2 sparse + 2 Gaussian recipe gives mean RMSE **0.6215** against
+**0.6281** for a single PCA. PCA wins alone on large, well-conditioned targets;
+RP ensembles win on small, ill-conditioned ones (CHEMBL1871 −0.028,
+CHEMBL1862 −0.034). The mix captures both sides.
+
+### `cluster`
+
+```python
+from mlx_addons.cluster import KMeans
+km = KMeans(n_clusters=32, n_init=3, random_state=0).fit(X)
+km.labels_, km.cluster_centers_, km.predict(X_new)
+```
+
+Assignment is one Metal matmul + `argmin`; update is a one-hot `.T @ X` matmul.
+No custom kernels — the whole Lloyd loop is MLX ops.
+
+### `knn`
+
+```python
+from mlx_addons.knn import knn, KNNConfig, TreeConfig
+distances, indices = knn(mx.random.normal((100000, 3)), k=16)   # k up to 256
+```
+
+Pipeline: Morton encoding → Z-order sort → SoA tree build → GPU frontier walk →
+Metal segmented top-k. For *approximate* k-NN **graphs** rather than exact
+queries, `mlx_addons.nndescent` implements NNDescent in pure MLX.
+
+### `solvers`
+
+```python
+from mlx_addons.solvers import pulay_diis, commutator_error
+e = commutator_error(F, P)                                  # F @ P - P @ F
+F_extrap = pulay_diis(F_history, e_history, max_history=6)
+```
+
+The augmented `(nd+1) × (nd+1)` Pulay system is solved via `linalg.solve_lu`.
+Batched over leading dims, so one call extrapolates every molecule.
+
+### `optimizers`
+
+```python
+from mlx_addons.optimizers import Muon, zeropower_via_newtonschulz5
+```
+
+`Muon` with SYRK-accelerated Newton–Schulz orthogonalization. The end-to-end
+gain is **1.14× at 2048² and 1.35× at 8192²**, not the full 1.68× `syrk` gives
+in isolation — only 2 of the 3 matmuls per step have symmetric outputs.
+
+### `recurrent`
+
+```python
+from mlx_addons.recurrent import MetalLSTM, GroupedMetalLSTM
+from mlx_addons import fused_lstm, fused_lstm_sequence, fused_gru, fused_gru_sequence
+```
+
+`recurrent` fuses the LSTM **cell**. `fused_rnn` / `fused_gru` fuse the **whole
+sequence** into a single JIT Metal kernel with the input projection folded in,
+including a trainable fused-BPTT backward — `fused_lstm` matches or beats
+MPSGraph, and the GRU path is roughly 4–7× eager inference and ~17× training.
+
+---
+
+## Benchmarks
+
+Every measured table — Cholesky, QR, rSVD, PCA, Nyström, KernelPCA, random
+projection, CSR matmul, KMeans, Jacobi eigh, SP2 purification, SYRK — lives in
+**[docs/BENCHMARKS.md](docs/BENCHMARKS.md)**, with the hardware and methodology
+for each.
 
 ## License
 
